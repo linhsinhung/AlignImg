@@ -122,7 +122,7 @@ def apply_lowpass_batch(img_stack, sigma=2.0):
     if sigma <= 0: 
         return img_stack
         
-    # 判斷輸入維度
+    # Determine input dimensionality
     if img_stack.ndim == 2:
         # Case 1: Single Image (H, W) -> Apply isotropic sigma
         return ndi.gaussian_filter(img_stack, sigma=sigma)
