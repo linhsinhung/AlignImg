@@ -5,7 +5,7 @@ CryoEM 2D Alignment Unified API
 Integrates Serial (CPU), Parallel (CPU), and Batch (GPU) implementations.
 
 Usage:
-    from align_api import run_alignment
+    from alignimg_api import run_alignment
     
     # Auto (CPU Parallel):
     ref, history, params, offsets = run_alignment(X, init_ref)
