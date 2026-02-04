@@ -40,7 +40,7 @@ from alignimg_api import run_alignment
 # X: (N, H, W) stack of 2D particle images
 # initial_ref: (H, W) reference image
 
-final_ref, history, params, com_offsets = run_alignment(
+final_ref, history, params, meta = run_alignment(
     X,
     initial_ref,
     num_iterations=4,
@@ -51,7 +51,7 @@ final_ref, history, params, com_offsets = run_alignment(
 ### Force single-core (serial CPU)
 
 ```python
-final_ref, history, params, com_offsets = run_alignment(
+final_ref, history, params, meta = run_alignment(
     X,
     initial_ref,
     num_iterations=4,
@@ -62,7 +62,7 @@ final_ref, history, params, com_offsets = run_alignment(
 ### Use GPU (with automatic fallback to CPU)
 
 ```python
-final_ref, history, params, com_offsets = run_alignment(
+final_ref, history, params, meta = run_alignment(
     X,
     initial_ref,
     num_iterations=4,
@@ -86,7 +86,7 @@ final_ref, history, params, com_offsets = run_alignment(
   - `final_ref`: the aligned reference image.
   - `history`: list of reference images per iteration.
   - `params`: per-particle alignment parameters `[angle, dy, dx, score]`.
-  - `com_offsets`: pre-calculated center-of-mass offsets.
+  - `meta`: metadata dict with `com_offsets`, `engine`, `num_iterations`, and `mask_diameter`.
 
 ### Example: quick synthetic test
 
@@ -94,7 +94,7 @@ final_ref, history, params, com_offsets = run_alignment(
 from alignimg_api import generate_synthetic_data, run_alignment
 
 gt, X = generate_synthetic_data(N=200, H=128, W=128)
-final_ref, history, params, com_offsets = run_alignment(X, gt)
+final_ref, history, params, meta = run_alignment(X, gt)
 ```
 
 ## Notes
