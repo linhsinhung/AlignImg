@@ -444,17 +444,36 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
 # =============================================================================
 # [Utilities] Test & I/O
 # =============================================================================
-def run_transform(X, params):
+def run_transform(X, params, engine=None):
     """
     Apply alignment parameters from run_alignment to a data stack X.
 
     Args:
         X (np.ndarray): Particle stack (N, H, W).
         params (np.ndarray): Alignment parameters [Angle, Dy, Dx, Score].
+        engine (str | None): Alignment engine ("gpu", "cpu-serial", "cpu-parallel").
 
     Returns:
         np.ndarray: Aligned particle stack (N, H, W).
     """
+    use_gpu_transform = engine == "gpu"
+
+    if use_gpu_transform:
+        if not HAS_GPU or aug is None:
+            raise RuntimeError("GPU transform requested but GPU utilities are unavailable.")
+
+        X_gpu = X if hasattr(X, "get") else cp.asarray(X)
+        params_gpu = params if hasattr(params, "get") else cp.asarray(params)
+
+        N, H, W = X_gpu.shape
+        geo = aug.GeometryContext((H, W))
+        angles = params_gpu[:, 0]
+        dys = params_gpu[:, 1]
+        dxs = params_gpu[:, 2]
+
+        X_corrected_gpu = aug.warp_affine_batch(X_gpu, geo, angles, dys, dxs)
+        return cp.asnumpy(X_corrected_gpu)
+
     if hasattr(X, "get"):
         X = X.get()
     if hasattr(params, "get"):
@@ -466,8 +485,7 @@ def run_transform(X, params):
 
     for i in range(N):
         angle, dy, dx = params[i, 0], params[i, 1], params[i, 2]
-        shifted = au.shift_image(X[i], geo, dy, dx)
-        X_corrected[i] = au.rotate_image(shifted, geo, angle)
+        X_corrected[i] = au.transform_final_image(X[i], geo, angle, dy, dx)
 
     return X_corrected
 
@@ -588,7 +606,7 @@ if __name__ == "__main__":
     save_alignment_results(params, meta["com_offsets"], "api_params.csv")
 
     # --- Apply Transform & Visual Check ---
-    X_corrected = run_transform(X_data, params)
+    X_corrected = run_transform(X_data, params, engine=meta["engine"])
     plt.figure(figsize=(5, 5))
     plt.imshow(np.mean(X_corrected, axis=0), cmap='gray')
     plt.title("Corrected Average")
