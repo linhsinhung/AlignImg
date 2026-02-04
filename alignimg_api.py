@@ -429,6 +429,32 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
 # =============================================================================
 # [Utilities] Test & I/O
 # =============================================================================
+def run_transform(X, params):
+    """
+    Apply alignment parameters from run_alignment to a data stack X.
+
+    Args:
+        X (np.ndarray): Particle stack (N, H, W).
+        params (np.ndarray): Alignment parameters [Angle, Dy, Dx, Score].
+
+    Returns:
+        np.ndarray: Aligned particle stack (N, H, W).
+    """
+    if hasattr(X, "get"):
+        X = X.get()
+    if hasattr(params, "get"):
+        params = params.get()
+
+    N, H, W = X.shape
+    geo = au.get_geometry_context((H, W))
+    X_corrected = np.empty_like(X, dtype=np.float32)
+
+    for i in range(N):
+        angle, dy, dx = params[i, 0], params[i, 1], params[i, 2]
+        shifted = au.shift_image(X[i], geo, dy, dx)
+        X_corrected[i] = au.rotate_image(shifted, geo, angle)
+
+    return X_corrected
 
 def generate_synthetic_data(N=200, H=128, W=128, noise_level=1.0):
     print(f"Generating synthetic data (N={N}, Size={H}x{W})...")
@@ -545,3 +571,13 @@ if __name__ == "__main__":
     # --- Output ---
     plot_results(final_ref, X_data, gt_img=gt_img, save_path="api_result.png")
     save_alignment_results(params, offsets, "api_params.csv")
+
+    # --- Apply Transform & Visual Check ---
+    X_corrected = run_transform(X_data, params)
+    plt.figure(figsize=(5, 5))
+    plt.imshow(np.mean(X_corrected, axis=0), cmap='gray')
+    plt.title("Corrected Average")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig("api_corrected_mean.png")
+    print(">> Corrected mean saved to api_corrected_mean.png")
