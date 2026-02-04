@@ -96,7 +96,7 @@ def rotate_image(img, geo, angle):
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
     return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
 
-def transform_final_image(img, geo, angle, dy, dx, pre_shift=None):
+def transform_final_image(img, geo, angle, dy, dx):
     h, w = geo['H'], geo['W']
     angle = normalize_angle(angle)
     
@@ -104,11 +104,8 @@ def transform_final_image(img, geo, angle, dy, dx, pre_shift=None):
     M_rot = cv2.getRotationMatrix2D((geo['cx'], geo['cy']), angle, 1.0)
     
     # 2. Total Shift
-    total_dx = dx
-    total_dy = dy
-    if pre_shift is not None:
-        total_dx += pre_shift[1]
-        total_dy += pre_shift[0]
+    total_dx = -dx
+    total_dy = -dy
         
     # Combine (Approximation for speed, or strict two-step)
     # Let's do strict two-step to avoid matrix math errors manually
