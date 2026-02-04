@@ -22,9 +22,6 @@ import gc
 import time
 import numpy as np
 import multiprocessing
-import matplotlib.pyplot as plt
-import mrcfile
-import pandas as pd
 from tqdm import tqdm
 from functools import partial
 
@@ -501,6 +498,10 @@ def load_mrc_stack(path):
 # [Main Block] Self-Test
 # =============================================================================
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import mrcfile
+    import pandas as pd
+
     multiprocessing.freeze_support()
     
     # --- Configuration ---
