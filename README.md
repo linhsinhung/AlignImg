@@ -5,13 +5,19 @@ A self-made program for aligning a stack of typical cryo-EM images.
 
 AlignImg is a small, self-contained module. Install the Python dependencies and keep the repo on your `PYTHONPATH` (or install it in editable mode).
 
-### 1) Install required dependencies
+### 1) Install minimum dependencies
+
+```bash
+pip install numpy scipy opencv-python tqdm
+```
+
+### 2) Full dependencies (for running tests or demos)
 
 ```bash
 pip install numpy scipy opencv-python matplotlib mrcfile pandas tqdm
 ```
 
-### 2) (Optional) Enable GPU acceleration
+### 3) (Optional) Enable GPU acceleration
 
 If you want to use the GPU implementation, install CuPy for your CUDA version (example below uses CUDA 11.x):
 
