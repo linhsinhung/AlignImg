@@ -8,7 +8,7 @@ Usage:
     from alignimg_api import run_alignment
     
     # Auto (CPU Parallel):
-    ref, history, params, offsets = run_alignment(X, init_ref)
+    ref, history, params, meta = run_alignment(X, init_ref)
     
     # Force Single Core:
     run_alignment(..., n_jobs=1)
@@ -388,20 +388,24 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         final_ref (np.ndarray): Aligned reference.
         history (list): List of references per iteration.
         params (np.ndarray): Alignment parameters [Angle, Dy, Dx, Score].
-        com_offsets (np.ndarray): Pre-calculated CoM offsets.
+        meta (dict): Metadata containing CoM offsets and run configuration
+            (keys: com_offsets, engine, num_iterations, mask_diameter).
     """
-    
+    engine = None
+    final_ref = history = params = com_offsets = None
+
     # 1. GPU Logic with Fallback
     if use_gpu:
         if HAS_GPU:
             try:
                 # Attempt to run on GPU
-                return run_batch_alignment_gpu(
+                final_ref, history, params, com_offsets = run_batch_alignment_gpu(
                     X, initial_ref, 
                     num_iterations=num_iterations, 
                     mask_diameter=mask_diameter,
                     batch_size=batch_size
                 )
+                engine = "gpu"
             except Exception as e:
                 print(f"\n[WARNING] GPU execution failed: {e}")
                 print("Switching to CPU mode automatically...\n")
@@ -410,20 +414,31 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
             print("Switching to CPU mode automatically...\n")
             
     # 2. CPU Logic (Dispatch based on n_jobs)
-    if n_jobs == 1:
-        return run_stateful_alignment_serial(
-            X, initial_ref, 
-            num_iterations=num_iterations, 
-            mask_diameter=mask_diameter
-        )
-    else:
-        # n_jobs = None, -1, or > 1 all imply parallel
-        return run_stateful_alignment_parallel(
-            X, initial_ref, 
-            num_iterations=num_iterations, 
-            mask_diameter=mask_diameter,
-            n_jobs=n_jobs
-        )
+    if engine != "gpu":
+        if n_jobs == 1:
+            final_ref, history, params, com_offsets = run_stateful_alignment_serial(
+                X, initial_ref, 
+                num_iterations=num_iterations, 
+                mask_diameter=mask_diameter
+            )
+            engine = "cpu-serial"
+        else:
+            # n_jobs = None, -1, or > 1 all imply parallel
+            final_ref, history, params, com_offsets = run_stateful_alignment_parallel(
+                X, initial_ref, 
+                num_iterations=num_iterations, 
+                mask_diameter=mask_diameter,
+                n_jobs=n_jobs
+            )
+            engine = "cpu-parallel"
+
+    meta = {
+        "com_offsets": com_offsets,
+        "engine": engine,
+        "num_iterations": num_iterations,
+        "mask_diameter": mask_diameter,
+    }
+    return final_ref, history, params, meta
 
 
 # =============================================================================
@@ -556,7 +571,7 @@ if __name__ == "__main__":
     # --- Run API ---
     start_time = time.time()
     
-    final_ref, history, params, offsets = run_alignment(
+    final_ref, history, params, meta = run_alignment(
         X_data, 
         init_ref, 
         num_iterations=4, 
@@ -570,7 +585,7 @@ if __name__ == "__main__":
     
     # --- Output ---
     plot_results(final_ref, X_data, gt_img=gt_img, save_path="api_result.png")
-    save_alignment_results(params, offsets, "api_params.csv")
+    save_alignment_results(params, meta["com_offsets"], "api_params.csv")
 
     # --- Apply Transform & Visual Check ---
     X_corrected = run_transform(X_data, params)
