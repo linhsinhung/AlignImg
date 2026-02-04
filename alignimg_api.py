@@ -444,6 +444,12 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
 # =============================================================================
 # [Utilities] Test & I/O
 # =============================================================================
+def _transform_worker(args):
+    """Worker: Apply transform to a single image (CPU)."""
+    img, angle, dy, dx = args
+    geo = au.get_geometry_context(img.shape)
+    return au.transform_final_image(img, geo, angle, dy, dx)
+
 def run_transform(X, params, engine=None):
     """
     Apply alignment parameters from run_alignment to a data stack X.
@@ -480,9 +486,16 @@ def run_transform(X, params, engine=None):
         params = params.get()
 
     N, H, W = X.shape
-    geo = au.get_geometry_context((H, W))
     X_corrected = np.empty_like(X, dtype=np.float32)
 
+    if engine == "cpu-parallel":
+        work_items = [(X[i], params[i, 0], params[i, 1], params[i, 2]) for i in range(N)]
+        with multiprocessing.Pool() as pool:
+            results = pool.map(_transform_worker, work_items)
+        X_corrected[:] = np.stack(results, axis=0)
+        return X_corrected
+
+    geo = au.get_geometry_context((H, W))
     for i in range(N):
         angle, dy, dx = params[i, 0], params[i, 1], params[i, 2]
         X_corrected[i] = au.transform_final_image(X[i], geo, angle, dy, dx)
