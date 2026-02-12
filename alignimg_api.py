@@ -680,7 +680,7 @@ if __name__ == "__main__":
     
     # --- Configuration ---
     USE_GPU_FLAG = True   # Change this to test switching
-    N_JOBS = -2           # 1 for Serial, -1 for Parallel
+    N_JOBS = -1           # 1 for Serial, -1 for Parallel
     
     path_data = './test_align.mrcs'
     path_gt = './mu_aligned_mean.mrc'
