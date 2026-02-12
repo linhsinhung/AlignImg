@@ -35,6 +35,45 @@ except ImportError:
     HAS_GPU = False
     aug = None
 
+
+class _PinnedHostBufferPool:
+    """Small reusable pool of pinned NumPy host buffers (double-buffer friendly)."""
+
+    def __init__(self, capacity=2):
+        self.capacity = max(1, int(capacity))
+        self._buffers = {}
+
+    def get(self, shape, dtype=np.float32):
+        key = (tuple(shape), np.dtype(dtype).str)
+        if key not in self._buffers:
+            if len(self._buffers) >= self.capacity:
+                self._buffers.pop(next(iter(self._buffers)))
+            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
+            host_view = np.frombuffer(pinned_mem, dtype=dtype).reshape(shape)
+            self._buffers[key] = (pinned_mem, host_view)
+        return self._buffers[key][1]
+
+
+def _async_h2d(dst_gpu, src_host, stream):
+    cp.cuda.runtime.memcpyAsync(
+        dst_gpu.data.ptr,
+        src_host.ctypes.data,
+        src_host.nbytes,
+        cp.cuda.runtime.memcpyHostToDevice,
+        stream.ptr,
+    )
+
+
+def _async_d2h(dst_host, src_gpu, stream):
+    cp.cuda.runtime.memcpyAsync(
+        dst_host.ctypes.data,
+        src_gpu.data.ptr,
+        dst_host.nbytes,
+        cp.cuda.runtime.memcpyDeviceToHost,
+        stream.ptr,
+    )
+
 # =============================================================================
 # [Multiprocessing Workers]
 # Must be at module level for pickling
@@ -331,30 +370,89 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
 # =============================================================================
 # [Engine 3] GPU Implementation (CuPy)
 # =============================================================================
-def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diameter=None, batch_size=8192):
+def run_batch_alignment_gpu(
+    X_cpu,
+    initial_ref_cpu,
+    num_iterations=4,
+    mask_diameter=None,
+    batch_size=4096,
+    profile_gpu=False,
+):
     """ GPU Alignment Driver using align_utils_gpu """
     print(f">> Mode: GPU Accelerated (CuPy), Batch Size={batch_size}")
     
     # Init GPU resources
     N, H, W = X_cpu.shape
-    mempool = cp.get_default_memory_pool()
     geo = aug.GeometryContext((H, W))
+    pinned_pool = _PinnedHostBufferPool(capacity=8)
+
+    stream_copy = cp.cuda.Stream(non_blocking=True)
+    stream_compute = cp.cuda.Stream(non_blocking=True)
+    ev_h2d_done = [cp.cuda.Event(), cp.cuda.Event()]
+    ev_compute_done = [cp.cuda.Event(), cp.cuda.Event()]
     
     state_params = np.zeros((N, 4), dtype=np.float32) 
     com_offsets = np.zeros((N, 2), dtype=np.float32)
     
     current_ref_gpu = cp.array(initial_ref_cpu, dtype=cp.float32)
     current_ref_gpu = aug.apply_circular_mask_batch(current_ref_gpu, geo, diameter=mask_diameter)
+
+    d_img_buffers = [cp.empty((batch_size, H, W), dtype=cp.float32), cp.empty((batch_size, H, W), dtype=cp.float32)]
+
+    profile = {"h2d_ms": [], "compute_ms": [], "d2h_ms": [], "e2e_ms": []} if profile_gpu else None
     
     # 1. CoM Batch
     print("   [Step 0] GPU CoM Calculation...")
-    for start_idx in tqdm(range(0, N, batch_size), desc="   CoM"):
-        end_idx = min(start_idx + batch_size, N)
-        batch_gpu = cp.array(X_cpu[start_idx:end_idx], dtype=cp.float32)
-        offsets_gpu = aug.calculate_com_batch(batch_gpu, geo)
-        com_offsets[start_idx:end_idx] = cp.asnumpy(offsets_gpu)
-        del batch_gpu, offsets_gpu
-        mempool.free_all_blocks()
+    com_host_buffers = [
+        pinned_pool.get((batch_size, 2), dtype=np.float32),
+        pinned_pool.get((batch_size, 2), dtype=np.float32),
+    ]
+    batch_ranges = [(s, min(s + batch_size, N)) for s in range(0, N, batch_size)]
+    if batch_ranges:
+        start0, end0 = batch_ranges[0]
+        bs0 = end0 - start0
+        h_stage0 = pinned_pool.get((batch_size, H, W), dtype=np.float32)
+        np.copyto(h_stage0[:bs0], np.ascontiguousarray(X_cpu[start0:end0], dtype=np.float32), casting="no")
+        with stream_copy:
+            _async_h2d(d_img_buffers[0][:bs0], h_stage0[:bs0], stream_copy)
+            ev_h2d_done[0].record(stream_copy)
+
+    for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   CoM")):
+        buf = bi % 2
+        curr_bs = end_idx - start_idx
+
+        if bi + 1 < len(batch_ranges):
+            nstart, nend = batch_ranges[bi + 1]
+            nbs = nend - nstart
+            h_stage_next = pinned_pool.get((batch_size, H, W), dtype=np.float32)
+            np.copyto(h_stage_next[:nbs], np.ascontiguousarray(X_cpu[nstart:nend], dtype=np.float32), casting="no")
+            with stream_copy:
+                _async_h2d(d_img_buffers[1 - buf][:nbs], h_stage_next[:nbs], stream_copy)
+                ev_h2d_done[1 - buf].record(stream_copy)
+
+        stream_compute.wait_event(ev_h2d_done[buf])
+        with stream_compute:
+            comp_start = cp.cuda.Event() if profile_gpu else None
+            comp_end = cp.cuda.Event() if profile_gpu else None
+            if profile_gpu:
+                comp_start.record(stream_compute)
+            offsets_gpu = aug.calculate_com_batch(d_img_buffers[buf][:curr_bs], geo)
+            if profile_gpu:
+                comp_end.record(stream_compute)
+            ev_compute_done[buf].record(stream_compute)
+
+        with stream_copy:
+            stream_copy.wait_event(ev_compute_done[buf])
+            _async_d2h(com_host_buffers[buf][:curr_bs], offsets_gpu, stream_copy)
+
+        stream_copy.synchronize()
+        com_offsets[start_idx:end_idx] = com_host_buffers[buf][:curr_bs]
+
+        if profile_gpu:
+            h2d_ms = cp.cuda.get_elapsed_time(ev_h2d_done[buf], ev_compute_done[buf])
+            compute_ms = cp.cuda.get_elapsed_time(comp_start, comp_end)
+            profile["h2d_ms"].append(max(0.0, h2d_ms - compute_ms))
+            profile["compute_ms"].append(compute_ms)
         
     history_refs = []
     
@@ -367,79 +465,140 @@ def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diame
         ref_match = aug.apply_lowpass_batch(ref_masked, sigma=lp_sigma)
         ref_accum_gpu = cp.zeros((H, W), dtype=cp.float32)
         
-        for start_idx in tqdm(range(0, N, batch_size), desc="   Aligning"):
-            end_idx = min(start_idx + batch_size, N)
+        params_host_buffers = [
+            pinned_pool.get((batch_size, 4), dtype=np.float32),
+            pinned_pool.get((batch_size, 4), dtype=np.float32),
+        ]
+
+        if batch_ranges:
+            start0, end0 = batch_ranges[0]
+            bs0 = end0 - start0
+            h_stage0 = pinned_pool.get((batch_size, H, W), dtype=np.float32)
+            np.copyto(h_stage0[:bs0], np.ascontiguousarray(X_cpu[start0:end0], dtype=np.float32), casting="no")
+            with stream_copy:
+                _async_h2d(d_img_buffers[0][:bs0], h_stage0[:bs0], stream_copy)
+                ev_h2d_done[0].record(stream_copy)
+
+        for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   Aligning")):
+            buf = bi % 2
             curr_bs = end_idx - start_idx
-            
-            # Load
-            img_batch = cp.array(X_cpu[start_idx:end_idx], dtype=cp.float32)
-            
-            # Get State
-            if is_global_search:
-                bias_y = cp.array(com_offsets[start_idx:end_idx, 0])
-                bias_x = cp.array(com_offsets[start_idx:end_idx, 1])
-                curr_angle = cp.zeros(curr_bs, dtype=cp.float32)
-            else:
-                p_batch = cp.array(state_params[start_idx:end_idx])
-                curr_angle = p_batch[:, 0]
-                bias_y, bias_x = p_batch[:, 1], p_batch[:, 2]
-                
-            # Shift
-            img_centered = aug.warp_affine_batch(img_batch, geo, cp.zeros_like(curr_angle), bias_y, bias_x)
-            
-            # Match Prep
-            mask = geo.get_circular_mask(diameter=mask_diameter)
-            img_match = aug.apply_lowpass_batch(img_centered * mask, sigma=lp_sigma)
-            
-            # Angle
-            if is_global_search:
-                raw_ang = aug.get_coarse_angle_fm_batch(img_match, ref_match, geo)
-                center_ang, _ = aug.check_180_ambiguity_batch(img_match, ref_match, raw_ang, geo)
-            else:
-                center_ang = curr_angle
-            
-            # Fine Search
-            best = aug.fine_alignment_search_batch(img_match, ref_match, center_ang, geo, 
-                                                   search_range=search_range, step=search_step)
-            
-            # Update Logic
-            res_dy, res_dx = best['dy'], best['dx']
-            final_ang = best['angle']
-            
-            rad = cp.deg2rad(-final_ang)
-            cos_r, sin_r = cp.cos(rad), cp.sin(rad)
-            res_dx_pre = res_dx * cos_r - res_dy * sin_r
-            res_dy_pre = res_dx * sin_r + res_dy * cos_r
-            
-            new_by = bias_y - res_dy_pre
-            new_bx = bias_x - res_dx_pre
-            
-            # Store State
-            new_params = np.stack([
-                cp.asnumpy(final_ang), cp.asnumpy(new_by), cp.asnumpy(new_bx), cp.asnumpy(best['score'])
-            ], axis=1)
-            state_params[start_idx:end_idx] = new_params
-            
-            # Accumulate
-            aligned_batch = aug.warp_affine_batch(img_batch, geo, final_ang, new_by, new_bx)
-            ref_accum_gpu += cp.sum(aligned_batch, axis=0)
-            
-            del img_batch, img_centered, img_match, aligned_batch
-            mempool.free_all_blocks()
+
+            if bi + 1 < len(batch_ranges):
+                nstart, nend = batch_ranges[bi + 1]
+                nbs = nend - nstart
+                h_stage_next = pinned_pool.get((batch_size, H, W), dtype=np.float32)
+                np.copyto(h_stage_next[:nbs], np.ascontiguousarray(X_cpu[nstart:nend], dtype=np.float32), casting="no")
+                with stream_copy:
+                    _async_h2d(d_img_buffers[1 - buf][:nbs], h_stage_next[:nbs], stream_copy)
+                    ev_h2d_done[1 - buf].record(stream_copy)
+
+            img_batch = d_img_buffers[buf][:curr_bs]
+            stream_compute.wait_event(ev_h2d_done[buf])
+            with stream_compute:
+                e2e_start = cp.cuda.Event() if profile_gpu else None
+                comp_start = cp.cuda.Event() if profile_gpu else None
+                comp_end = cp.cuda.Event() if profile_gpu else None
+                if profile_gpu:
+                    e2e_start.record(stream_compute)
+                    comp_start.record(stream_compute)
+
+                # Get State
+                if is_global_search:
+                    bias_y = cp.asarray(com_offsets[start_idx:end_idx, 0], dtype=cp.float32)
+                    bias_x = cp.asarray(com_offsets[start_idx:end_idx, 1], dtype=cp.float32)
+                    curr_angle = cp.zeros(curr_bs, dtype=cp.float32)
+                else:
+                    p_batch = cp.asarray(state_params[start_idx:end_idx], dtype=cp.float32)
+                    curr_angle = p_batch[:, 0]
+                    bias_y, bias_x = p_batch[:, 1], p_batch[:, 2]
+
+                # Shift
+                img_centered = aug.warp_affine_batch(img_batch, geo, cp.zeros_like(curr_angle), bias_y, bias_x)
+
+                # Match Prep
+                mask = geo.get_circular_mask(diameter=mask_diameter)
+                img_match = aug.apply_lowpass_batch(img_centered * mask, sigma=lp_sigma)
+
+                # Angle
+                if is_global_search:
+                    raw_ang = aug.get_coarse_angle_fm_batch(img_match, ref_match, geo)
+                    center_ang, _ = aug.check_180_ambiguity_batch(img_match, ref_match, raw_ang, geo)
+                else:
+                    center_ang = curr_angle
+
+                # Fine Search
+                best = aug.fine_alignment_search_batch(img_match, ref_match, center_ang, geo,
+                                                       search_range=search_range, step=search_step)
+
+                # Update Logic
+                res_dy, res_dx = best['dy'], best['dx']
+                final_ang = best['angle']
+
+                rad = cp.deg2rad(-final_ang)
+                cos_r, sin_r = cp.cos(rad), cp.sin(rad)
+                res_dx_pre = res_dx * cos_r - res_dy * sin_r
+                res_dy_pre = res_dx * sin_r + res_dy * cos_r
+
+                new_by = bias_y - res_dy_pre
+                new_bx = bias_x - res_dx_pre
+
+                # Store State
+                params_gpu = cp.stack([final_ang, new_by, new_bx, best['score']], axis=1)
+                if profile_gpu:
+                    comp_end.record(stream_compute)
+
+                # Accumulate
+                aligned_batch = aug.warp_affine_batch(img_batch, geo, final_ang, new_by, new_bx)
+                ref_accum_gpu += cp.sum(aligned_batch, axis=0)
+
+                ev_compute_done[buf].record(stream_compute)
+
+            with stream_copy:
+                stream_copy.wait_event(ev_compute_done[buf])
+                _async_d2h(params_host_buffers[buf][:curr_bs], params_gpu, stream_copy)
+
+            stream_copy.synchronize()
+            state_params[start_idx:end_idx] = params_host_buffers[buf][:curr_bs]
+
+            if profile_gpu:
+                e2e_end = cp.cuda.Event()
+                with stream_copy:
+                    e2e_end.record(stream_copy)
+                stream_copy.synchronize()
+                profile["compute_ms"].append(cp.cuda.get_elapsed_time(comp_start, comp_end))
+                profile["e2e_ms"].append(cp.cuda.get_elapsed_time(e2e_start, e2e_end))
+                profile["h2d_ms"].append(cp.cuda.get_elapsed_time(ev_h2d_done[buf], comp_start))
+                profile["d2h_ms"].append(cp.cuda.get_elapsed_time(ev_compute_done[buf], e2e_end))
             
         new_ref = ref_accum_gpu / N
         new_ref = (new_ref - cp.mean(new_ref)) / (cp.std(new_ref) + 1e-8)
         current_ref_gpu = new_ref * geo.get_circular_mask(diameter=mask_diameter)
         
         history_refs.append(cp.asnumpy(current_ref_gpu))
-        
-    return cp.asnumpy(current_ref_gpu), history_refs, state_params, com_offsets
+
+    meta = None
+    if profile_gpu and profile["e2e_ms"]:
+        h2d = float(np.mean(profile["h2d_ms"]))
+        compute = float(np.mean(profile["compute_ms"]))
+        d2h = float(np.mean(profile["d2h_ms"])) if profile["d2h_ms"] else 0.0
+        e2e = float(np.mean(profile["e2e_ms"]))
+        denom = (h2d + compute + d2h) + 1e-8
+        overlap_ratio = max(0.0, min(1.0, (h2d + compute + d2h - e2e) / denom))
+        meta = {
+            "avg_h2d_ms": h2d,
+            "avg_compute_ms": compute,
+            "avg_d2h_ms": d2h,
+            "avg_end_to_end_ms": e2e,
+            "overlap_ratio": overlap_ratio,
+        }
+
+    return cp.asnumpy(current_ref_gpu), history_refs, state_params, com_offsets, meta
 
 # =============================================================================
 # [Main API] The Unified Interface
 # =============================================================================
 def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None, 
-                  use_gpu=False, n_jobs=None, batch_size=8192):
+                  use_gpu=False, n_jobs=None, batch_size=4096, profile_gpu=False):
     """
     Unified entry point for 2D Alignment.
     
@@ -453,13 +612,14 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                       1 = Serial (Single Core). 
                       None or -1 = Use all available cores (Parallel).
         batch_size (int): Batch size for GPU processing.
-        
+        profile_gpu (bool): Collect lightweight CUDA event timings for GPU execution.
+
     Returns:
         final_ref (np.ndarray): Aligned reference.
         history (list): List of references per iteration.
         params (np.ndarray): Alignment parameters [Angle, Dy, Dx, Score].
         meta (dict): Metadata containing CoM offsets and run configuration
-            (keys: com_offsets, engine, num_iterations, mask_diameter).
+            (keys: com_offsets, engine, num_iterations, mask_diameter, optional gpu_profile).
     Notes on parameter convention:
     - params = [angle, dy, dx, score]
     - dy/dx are stored in the engine's internal convention.
@@ -476,11 +636,12 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         if HAS_GPU:
             try:
                 # Attempt to run on GPU
-                final_ref, history, params, com_offsets = run_batch_alignment_gpu(
+                final_ref, history, params, com_offsets, gpu_profile = run_batch_alignment_gpu(
                     X, initial_ref, 
                     num_iterations=num_iterations, 
                     mask_diameter=mask_diameter,
-                    batch_size=batch_size
+                    batch_size=batch_size,
+                    profile_gpu=profile_gpu,
                 )
                 engine = "gpu"
             except Exception as e:
@@ -515,6 +676,8 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         "num_iterations": num_iterations,
         "mask_diameter": mask_diameter,
     }
+    if engine == "gpu" and profile_gpu:
+        meta["gpu_profile"] = gpu_profile
     return final_ref, history, params, meta
 
 
