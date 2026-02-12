@@ -43,6 +43,7 @@ class GeometryContext:
         # Pre-calculate the sample coordinates (source_y, source_x) 
         # that map the image to log-polar space.
         self._init_log_polar_grid()
+        self._mask_cache = {}
 
     def _init_log_polar_grid(self):
         """
@@ -78,6 +79,10 @@ class GeometryContext:
 
     def get_circular_mask(self, diameter=None, soft_edge=5):
         """ Generates or retrieves a cached mask. """
+        key = (None if diameter is None else float(diameter), int(soft_edge))
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+
         radius = (diameter / 2.0) if diameter else (self.max_radius - 1)
         inner = radius - soft_edge
         
@@ -92,6 +97,7 @@ class GeometryContext:
         norm_dists = (dists - inner) / soft_edge
         mask[edge_indices] = 0.5 * (1 + cp.cos(norm_dists * cp.pi))
         
+        self._mask_cache[key] = mask
         return mask
 
 # === 1. Pre-processing & Utilities ===
