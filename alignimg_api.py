@@ -23,7 +23,6 @@ import time
 import numpy as np
 import multiprocessing
 from tqdm import tqdm
-from functools import partial
 
 # === Imports & GPU Check ===
 import align_utils as au
@@ -41,210 +40,286 @@ except ImportError:
 # Must be at module level for pickling
 # =============================================================================
 
-def _worker_calc_com(data_pack):
-    """ Worker: Calculate Center of Mass (CPU Parallel) """
-    img, geo, sigma = data_pack
-    dy, dx = au.calculate_center_of_mass_shift(img, geo, sigma=sigma)
+# ---- Global slots for multiprocessing initializer (avoid pickling big objects per task) ----
+_GEO = None
+_REF_MATCH = None
+_MASK_DIAMETER = None
+_LP_SIGMA = None
+_IS_GLOBAL = None
+_SEARCH_RANGE = None
+_SEARCH_STEP = None
+_COM_SIGMA = None
+
+def _init_worker_com(geo, sigma: int):
+    """Initializer for CoM workers."""
+    global _GEO, _COM_SIGMA
+    _GEO = geo
+    _COM_SIGMA = sigma
+
+def _worker_calc_com(img: np.ndarray):
+    """Worker: Calculate Center of Mass (CPU Parallel)."""
+    dy, dx = au.calculate_center_of_mass_shift(img, _GEO, sigma=_COM_SIGMA)
     return np.array([dy, dx], dtype=np.float32)
 
-def _worker_align_particle(data_pack):
-    """ Worker: Single Particle Alignment Logic (CPU Parallel) """
-    (idx, img, current_ref_smooth, 
-     geo, mask_diameter, lp_sigma, 
-     is_global_search, search_range, search_step, 
-     param_angle, param_dy, param_dx, 
-     com_dy, com_dx) = data_pack
+def _init_worker_align(geo, ref_match, mask_diameter, lp_sigma,
+                       is_global_search, search_range, search_step):
+    """
+    Initializer for alignment workers (per-iteration).
+    """
+    global _GEO, _REF_MATCH, _MASK_DIAMETER, _LP_SIGMA, _IS_GLOBAL, _SEARCH_RANGE, _SEARCH_STEP
+    _GEO = geo
+    _REF_MATCH = ref_match
+    _MASK_DIAMETER = mask_diameter
+    _LP_SIGMA = lp_sigma
+    _IS_GLOBAL = is_global_search
+    _SEARCH_RANGE = search_range
+    _SEARCH_STEP = search_step
 
-    # A. Apply Shift (Pre-rotation)
-    if is_global_search:
-        current_bias_y, current_bias_x = com_dy, com_dx
-        current_angle = 0.0
-    else:
-        current_bias_y, current_bias_x = param_dy, param_dx
-        current_angle = param_angle
 
+def _align_one_cpu(
+    img: np.ndarray,
+    geo,
+    ref_match: np.ndarray,
+    mask_diameter,
+    lp_sigma: float,
+    is_global_search: bool,
+    search_range: float,
+    search_step: float,
+    current_bias_y: float,
+    current_bias_x: float,
+    current_angle: float,
+):
+    """
+    Shared core logic for aligning one particle (used by serial + parallel).
+    Returns: (new_params[4], aligned_img[H,W])
+    """
+    # A) Apply pre-shift (pre-rotation frame)
     img_centered = au.shift_image(img, geo, current_bias_y, current_bias_x)
-    
-    # Prepare for matching
+
+    # B) Prepare for matching
     img_masked = au.apply_circular_mask(img_centered, geo, diameter=mask_diameter)
     img_for_matching = au.apply_lowpass_filter(img_masked, sigma=lp_sigma)
 
-    # B. Determine Angle
+    # C) Determine coarse angle (global only)
     if is_global_search:
-        raw_angle = au.get_coarse_angle_fourier_mellin(img_for_matching, current_ref_smooth, geo)
-        center_angle, _ = au.check_180_ambiguity(img_for_matching, current_ref_smooth, raw_angle, geo)
+        raw_angle = au.get_coarse_angle_fourier_mellin(img_for_matching, ref_match, geo)
+        center_angle, _ = au.check_180_ambiguity(img_for_matching, ref_match, raw_angle, geo)
     else:
         center_angle = current_angle
 
-    # C. Fine Tuning (Residuals in Post-rotation frame)
+    # D) Fine search
     best = au.fine_alignment_search(
-        img_for_matching, current_ref_smooth, center_angle, geo,
+        img_for_matching, ref_match, center_angle, geo,
         search_range=search_range, step=search_step
     )
 
-    # D. Update State (Logic Fix)
-    res_dy, res_dx = best['dy'], best['dx']
-    best_angle = best['angle']
-    best_score = best['score']
+    # E) Update state (back-rotate residuals to pre-rotation frame)
+    res_dy, res_dx = best["dy"], best["dx"]
+    best_angle = best["angle"]
+    best_score = best["score"]
 
-    # Back rotation of residuals
     rad = np.deg2rad(-best_angle)
-    res_dx_pre = res_dx * np.cos(rad) - res_dy * np.sin(rad)
-    res_dy_pre = res_dx * np.sin(rad) + res_dy * np.cos(rad)
+    cos_r, sin_r = np.cos(rad), np.sin(rad)
+
+    res_dx_pre = res_dx * cos_r - res_dy * sin_r
+    res_dy_pre = res_dx * sin_r + res_dy * cos_r
 
     new_bias_y = current_bias_y - res_dy_pre
     new_bias_x = current_bias_x - res_dx_pre
 
-    # E. Generate Final Image
+    # F) Generate aligned image (for ref accumulation)
     final_shifted = au.shift_image(img, geo, new_bias_y, new_bias_x)
     aligned_img = au.rotate_image(final_shifted, geo, best_angle)
 
     new_params = np.array([best_angle, new_bias_y, new_bias_x, best_score], dtype=np.float32)
+    return new_params, aligned_img
+
+
+def _worker_align_particle(task):
+    """
+    Worker: Align a single particle (CPU Parallel).
+
+    task = (idx, img, param_angle, param_dy, param_dx, com_dy, com_dx)
+    Uses globals initialized by _init_worker_align.
+    """
+    idx, img, param_angle, param_dy, param_dx, com_dy, com_dx = task
+
+    # Determine current bias/angle
+    if _IS_GLOBAL:
+        current_bias_y, current_bias_x = float(com_dy), float(com_dx)
+        current_angle = 0.0
+    else:
+        current_bias_y, current_bias_x = float(param_dy), float(param_dx)
+        current_angle = float(param_angle)
+
+    new_params, aligned_img = _align_one_cpu(
+        img=img,
+        geo=_GEO,
+        ref_match=_REF_MATCH,
+        mask_diameter=_MASK_DIAMETER,
+        lp_sigma=_LP_SIGMA,
+        is_global_search=_IS_GLOBAL,
+        search_range=_SEARCH_RANGE,
+        search_step=_SEARCH_STEP,
+        current_bias_y=current_bias_y,
+        current_bias_x=current_bias_x,
+        current_angle=current_angle,
+    )
     return idx, new_params, aligned_img
 
+# =============================================================================
+# Utilitys
+# =============================================================================
+def iter_params(it: int, num_iterations: int):
+    """
+    Defines the alignment schedule per iteration.
+    Single-source-of-truth so CPU/GPU engines match behavior.
+    """
+    lp_sigma = 3.0 if it == 0 else (1.0 if it == 1 else 0.0)
+    is_global_search = (it == 0)
+    search_range = 15 if is_global_search else 5
+    search_step = 2.0 if it < num_iterations - 1 else 0.5
+    return lp_sigma, is_global_search, search_range, search_step
 
 # =============================================================================
 # [Engine 1] Serial Implementation (CPU)
 # =============================================================================
 def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diameter=None):
-    """ Standard serial processing compatible with align_utils.py """
+    """Standard serial processing compatible with align_utils.py"""
     print(">> Mode: Serial (CPU Single Core)")
     N, H, W = X.shape
     geo = au.get_geometry_context((H, W))
-    
-    # 1. CoM
+
+    # 1) CoM
     print("   [Step 0] Pre-calculating CoM...")
     com_offsets = np.zeros((N, 2), dtype=np.float32)
     for i in tqdm(range(N), desc="   CoM"):
         com_offsets[i] = au.calculate_center_of_mass_shift(X[i], geo, sigma=5)
-    
-    state_params = np.zeros((N, 4), dtype=np.float32) # [angle, dy, dx, score]
+
+    # 2) Init
+    state_params = np.zeros((N, 4), dtype=np.float32)  # [angle, dy, dx, score]
     current_ref = au.apply_circular_mask(initial_ref.copy(), geo, diameter=mask_diameter)
     history_refs = [current_ref]
-    
+
+    # 3) Iterations
     for it in range(num_iterations):
-        lp_sigma = 3.0 if it == 0 else (1.0 if it == 1 else 0.0)
-        is_global_search = (it == 0)
-        search_range = 15 if is_global_search else 5 
-        search_step = 2.0 if it < num_iterations - 1 else 0.5
-        
+        lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
         print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
-        
+
+        ref_match = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
+
         ref_accumulator = np.zeros((H, W), dtype=np.float32)
-        scores_sum = 0
-        ref_for_matching = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
-        
-        for i in tqdm(range(N), desc=f"   Aligning"):
-            # Reuse logic via direct call or inline? Inline for speed in serial.
-            # (Logic identical to worker, kept inline for simplicity in serial engine)
-            
+        scores_sum = 0.0
+
+        for i in tqdm(range(N), desc="   Aligning"):
             if is_global_search:
-                curr_bias_y, curr_bias_x = com_offsets[i, 0], com_offsets[i, 1]
-                curr_angle = 0.0
+                current_bias_y, current_bias_x = float(com_offsets[i, 0]), float(com_offsets[i, 1])
+                current_angle = 0.0
             else:
-                curr_angle = state_params[i, 0]
-                curr_bias_y, curr_bias_x = state_params[i, 1], state_params[i, 2]
-                
-            img_centered = au.shift_image(X[i], geo, curr_bias_y, curr_bias_x)
-            img_masked = au.apply_circular_mask(img_centered, geo, diameter=mask_diameter)
-            img_match = au.apply_lowpass_filter(img_masked, sigma=lp_sigma)
-            
-            if is_global_search:
-                raw = au.get_coarse_angle_fourier_mellin(img_match, ref_for_matching, geo)
-                cen_ang, _ = au.check_180_ambiguity(img_match, ref_for_matching, raw, geo)
-            else:
-                cen_ang = curr_angle
-            
-            best = au.fine_alignment_search(img_match, ref_for_matching, cen_ang, geo, 
-                                            search_range=search_range, step=search_step)
-            
-            # Update Logic
-            rad = np.deg2rad(-best['angle'])
-            rdx = best['dx'] * np.cos(rad) - best['dy'] * np.sin(rad)
-            rdy = best['dx'] * np.sin(rad) + best['dy'] * np.cos(rad)
-            
-            nb_y = curr_bias_y - rdy
-            nb_x = curr_bias_x - rdx
-            
-            state_params[i] = [best['angle'], nb_y, nb_x, best['score']]
-            
-            # Accumulate
-            final_s = au.shift_image(X[i], geo, nb_y, nb_x)
-            aligned = au.rotate_image(final_s, geo, best['angle'])
-            ref_accumulator += aligned
-            scores_sum += best['score']
+                current_angle = float(state_params[i, 0])
+                current_bias_y, current_bias_x = float(state_params[i, 1]), float(state_params[i, 2])
+
+            new_params, aligned_img = _align_one_cpu(
+                img=X[i],
+                geo=geo,
+                ref_match=ref_match,
+                mask_diameter=mask_diameter,
+                lp_sigma=lp_sigma,
+                is_global_search=is_global_search,
+                search_range=search_range,
+                search_step=search_step,
+                current_bias_y=current_bias_y,
+                current_bias_x=current_bias_x,
+                current_angle=current_angle,
+            )
+
+            state_params[i] = new_params
+            ref_accumulator += aligned_img
+            scores_sum += float(new_params[3])
 
         new_ref = ref_accumulator / N
         new_ref = (new_ref - np.mean(new_ref)) / (np.std(new_ref) + 1e-8)
         current_ref = au.apply_circular_mask(new_ref, geo, diameter=mask_diameter)
         history_refs.append(current_ref)
-        
-    return current_ref, history_refs, state_params, com_offsets
 
+    return current_ref, history_refs, state_params, com_offsets
 
 # =============================================================================
 # [Engine 2] Parallel Implementation (CPU Multiprocessing)
 # =============================================================================
 def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diameter=None, n_jobs=-1):
-    """ Parallelized Alignment Driver """
-    
+    """Parallelized Alignment Driver (improved pickling efficiency)."""
+
     # Determine workers
     max_cores = multiprocessing.cpu_count()
     if n_jobs is None or n_jobs < 1:
-        num_workers = max(1, max_cores - 1) # Reserve 1 core
+        num_workers = max(1, max_cores - 1)  # reserve 1 core
     else:
-        num_workers = min(n_jobs, max_cores)
-        
+        num_workers = min(int(n_jobs), max_cores)
+
     print(f">> Mode: Parallel CPU (Workers={num_workers})")
-    
+
     N, H, W = X.shape
     geo = au.get_geometry_context((H, W))
-    
-    # 1. CoM Parallel
+
+    # 1) CoM in parallel (initializer avoids sending geo per task)
     print("   [Step 0] Parallel CoM Calculation...")
-    tasks_com = [(X[i], geo, 5) for i in range(N)]
-    com_offsets = np.zeros((N, 2), dtype=np.float32)
-    
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        results = list(tqdm(pool.imap(_worker_calc_com, tasks_com, chunksize=10), total=N, desc="   CoM"))
-    for i, res in enumerate(results):
-        com_offsets[i] = res
-        
+    with multiprocessing.Pool(
+        processes=num_workers,
+        initializer=_init_worker_com,
+        initargs=(geo, 5),
+    ) as pool:
+        results = list(tqdm(pool.imap(_worker_calc_com, X, chunksize=10), total=N, desc="   CoM"))
+
+    com_offsets = np.asarray(results, dtype=np.float32)
+
+    # 2) Init
     state_params = np.zeros((N, 4), dtype=np.float32)
     current_ref = au.apply_circular_mask(initial_ref.copy(), geo, diameter=mask_diameter)
     history_refs = [current_ref]
 
+    # 3) Iterations
     for it in range(num_iterations):
-        lp_sigma = 3.0 if it == 0 else (1.0 if it == 1 else 0.0)
-        is_global_search = (it == 0)
-        search_range = 15 if is_global_search else 5 
-        search_step = 2.0 if it < num_iterations - 1 else 0.5
-        
+        lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
         print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
-        ref_for_matching = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
-        
-        # Prepare Tasks
-        tasks_align = []
-        for i in range(N):
-            task = (
-                i, X[i], ref_for_matching, 
-                geo, mask_diameter, lp_sigma, 
-                is_global_search, search_range, search_step,
-                state_params[i,0], state_params[i,1], state_params[i,2], 
-                com_offsets[i,0], com_offsets[i,1]
-            )
-            tasks_align.append(task)
-            
+
+        ref_match = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
+
+        # Prepare tasks (small tuples only; geo/ref are globals in workers)
+        tasks = []
+        if is_global_search:
+            # state params unused in global search, but keep task format consistent
+            for i in range(N):
+                tasks.append((
+                    i,
+                    X[i],
+                    0.0, 0.0, 0.0,                  # param_angle, param_dy, param_dx
+                    float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                ))
+        else:
+            for i in range(N):
+                tasks.append((
+                    i,
+                    X[i],
+                    float(state_params[i, 0]), float(state_params[i, 1]), float(state_params[i, 2]),
+                    float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                ))
+
         ref_accumulator = np.zeros((H, W), dtype=np.float32)
         scores_sum = 0.0
-        
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            iterator = pool.imap(_worker_align_particle, tasks_align, chunksize=5)
+
+        # New pool per iteration (your original behavior), but now initializer injects geo/ref once
+        with multiprocessing.Pool(
+            processes=num_workers,
+            initializer=_init_worker_align,
+            initargs=(geo, ref_match, mask_diameter, lp_sigma, is_global_search, search_range, search_step),
+        ) as pool:
+            iterator = pool.imap(_worker_align_particle, tasks, chunksize=5)
             for idx, new_params, aligned_img in tqdm(iterator, total=N, desc="   Aligning"):
                 state_params[idx] = new_params
                 ref_accumulator += aligned_img
-                scores_sum += new_params[3]
-                
+                scores_sum += float(new_params[3])
+
         new_ref = ref_accumulator / N
         new_ref = (new_ref - np.mean(new_ref)) / (np.std(new_ref) + 1e-8)
         current_ref = au.apply_circular_mask(new_ref, geo, diameter=mask_diameter)
@@ -253,11 +328,10 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
 
     return current_ref, history_refs, state_params, com_offsets
 
-
 # =============================================================================
 # [Engine 3] GPU Implementation (CuPy)
 # =============================================================================
-def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diameter=None, batch_size=256):
+def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diameter=None, batch_size=4096):
     """ GPU Alignment Driver using align_utils_gpu """
     print(f">> Mode: GPU Accelerated (CuPy), Batch Size={batch_size}")
     
@@ -285,10 +359,7 @@ def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diame
     history_refs = []
     
     for it in range(num_iterations):
-        lp_sigma = 3.0 if it == 0 else (1.0 if it == 1 else 0.0)
-        is_global_search = (it == 0)
-        search_range = 15 if is_global_search else 5 
-        search_step = 2.0 if it < num_iterations - 1 else 0.5
+        lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
         
         print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
         
@@ -364,12 +435,11 @@ def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diame
         
     return cp.asnumpy(current_ref_gpu), history_refs, state_params, com_offsets
 
-
 # =============================================================================
 # [Main API] The Unified Interface
 # =============================================================================
 def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None, 
-                  use_gpu=False, n_jobs=None, batch_size=512):
+                  use_gpu=False, n_jobs=None, batch_size=4096):
     """
     Unified entry point for 2D Alignment.
     
@@ -390,6 +460,13 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         params (np.ndarray): Alignment parameters [Angle, Dy, Dx, Score].
         meta (dict): Metadata containing CoM offsets and run configuration
             (keys: com_offsets, engine, num_iterations, mask_diameter).
+    Notes on parameter convention:
+    - params = [angle, dy, dx, score]
+    - dy/dx are stored in the engine's internal convention.
+    - CPU and GPU transforms may differ by sign due to underlying library sampling conventions.
+      DO NOT "fix" this unless re-validating on real datasets.
+    - Always apply transforms via `run_transform(..., engine=meta["engine"])` to ensure correctness.
+
     """
     engine = None
     final_ref = history = params = com_offsets = None
@@ -444,11 +521,21 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
 # =============================================================================
 # [Utilities] Test & I/O
 # =============================================================================
-def _transform_worker(args):
-    """Worker: Apply transform to a single image (CPU)."""
-    img, angle, dy, dx = args
-    geo = au.get_geometry_context(img.shape)
-    return au.transform_final_image(img, geo, angle, dy, dx)
+_TRANS_GEO = None
+
+def _init_worker_transform(geo):
+    """Initializer for CPU-parallel transform workers."""
+    global _TRANS_GEO
+    _TRANS_GEO = geo
+
+def _transform_worker(task):
+    """
+    Worker: Apply transform to a single image (CPU).
+    task = (img, angle, dy, dx)
+    geo is provided by initializer to avoid recreating per image.
+    """
+    img, angle, dy, dx = task
+    return au.transform_final_image(img, _TRANS_GEO, angle, dy, dx)
 
 def run_transform(X, params, engine=None):
     """
@@ -464,6 +551,7 @@ def run_transform(X, params, engine=None):
     """
     use_gpu_transform = engine == "gpu"
 
+    # ---------------- GPU ----------------
     if use_gpu_transform:
         if not HAS_GPU or aug is None:
             raise RuntimeError("GPU transform requested but GPU utilities are unavailable.")
@@ -480,24 +568,38 @@ def run_transform(X, params, engine=None):
         X_corrected_gpu = aug.warp_affine_batch(X_gpu, geo, angles, dys, dxs)
         return cp.asnumpy(X_corrected_gpu)
 
+    # ---------------- CPU ----------------
     if hasattr(X, "get"):
         X = X.get()
     if hasattr(params, "get"):
         params = params.get()
 
-    N, H, W = X.shape
-    X_corrected = np.empty_like(X, dtype=np.float32)
+    X = np.asarray(X)
+    params = np.asarray(params)
 
+    N, H, W = X.shape
+    X_corrected = np.empty((N, H, W), dtype=np.float32)
+
+    geo = au.get_geometry_context((H, W))
+
+    # CPU-parallel path
     if engine == "cpu-parallel":
-        work_items = [(X[i], params[i, 0], params[i, 1], params[i, 2]) for i in range(N)]
-        with multiprocessing.Pool() as pool:
-            results = pool.map(_transform_worker, work_items)
+        # Keep tasks small: (img, angle, dy, dx)
+        tasks = [(X[i], float(params[i, 0]), float(params[i, 1]), float(params[i, 2])) for i in range(N)]
+
+        # Use a pool with initializer to avoid rebuilding geo each task
+        with multiprocessing.Pool(
+            initializer=_init_worker_transform,
+            initargs=(geo,),
+        ) as pool:
+            results = list(pool.imap(_transform_worker, tasks, chunksize=10))
+
         X_corrected[:] = np.stack(results, axis=0)
         return X_corrected
 
-    geo = au.get_geometry_context((H, W))
+    # CPU-serial path
     for i in range(N):
-        angle, dy, dx = params[i, 0], params[i, 1], params[i, 2]
+        angle, dy, dx = float(params[i, 0]), float(params[i, 1]), float(params[i, 2])
         X_corrected[i] = au.transform_final_image(X[i], geo, angle, dy, dx)
 
     return X_corrected
@@ -578,7 +680,7 @@ if __name__ == "__main__":
     
     # --- Configuration ---
     USE_GPU_FLAG = True   # Change this to test switching
-    N_JOBS = -1           # 1 for Serial, -1 for Parallel
+    N_JOBS = -2           # 1 for Serial, -1 for Parallel
     
     path_data = './test_align.mrcs'
     path_gt = './mu_aligned_mean.mrc'
