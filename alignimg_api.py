@@ -331,7 +331,7 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
 # =============================================================================
 # [Engine 3] GPU Implementation (CuPy)
 # =============================================================================
-def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diameter=None, batch_size=4096):
+def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diameter=None, batch_size=8192):
     """ GPU Alignment Driver using align_utils_gpu """
     print(f">> Mode: GPU Accelerated (CuPy), Batch Size={batch_size}")
     
@@ -439,7 +439,7 @@ def run_batch_alignment_gpu(X_cpu, initial_ref_cpu, num_iterations=4, mask_diame
 # [Main API] The Unified Interface
 # =============================================================================
 def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None, 
-                  use_gpu=False, n_jobs=None, batch_size=4096):
+                  use_gpu=False, n_jobs=None, batch_size=8192):
     """
     Unified entry point for 2D Alignment.
     
