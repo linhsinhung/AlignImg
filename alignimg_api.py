@@ -89,6 +89,11 @@ _SEARCH_RANGE = None
 _SEARCH_STEP = None
 _COM_SIGMA = None
 
+
+def _vprint(verbose: bool, *args, **kwargs):
+    if verbose:
+        print(*args, **kwargs)
+
 def _init_worker_com(geo, sigma: int):
     """Initializer for CoM workers."""
     global _GEO, _COM_SIGMA
@@ -223,16 +228,17 @@ def iter_params(it: int, num_iterations: int):
 # =============================================================================
 # [Engine 1] Serial Implementation (CPU)
 # =============================================================================
-def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diameter=None):
+def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diameter=None, verbose=True):
     """Standard serial processing compatible with align_utils.py"""
-    print(">> Mode: Serial (CPU Single Core)")
+    _vprint(verbose, ">> Mode: Serial (CPU Single Core)")
     N, H, W = X.shape
     geo = au.get_geometry_context((H, W))
 
     # 1) CoM
-    print("   [Step 0] Pre-calculating CoM...")
+    _vprint(verbose, "   [Step 0] Pre-calculating CoM...")
     com_offsets = np.zeros((N, 2), dtype=np.float32)
-    for i in tqdm(range(N), desc="   CoM"):
+    com_iter = tqdm(range(N), desc="   CoM", disable=not verbose)
+    for i in com_iter:
         com_offsets[i] = au.calculate_center_of_mass_shift(X[i], geo, sigma=5)
 
     # 2) Init
@@ -243,14 +249,15 @@ def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diamete
     # 3) Iterations
     for it in range(num_iterations):
         lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
-        print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
+        _vprint(verbose, f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
 
         ref_match = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
 
         ref_accumulator = np.zeros((H, W), dtype=np.float32)
         scores_sum = 0.0
 
-        for i in tqdm(range(N), desc="   Aligning"):
+        align_iter = tqdm(range(N), desc="   Aligning", disable=not verbose)
+        for i in align_iter:
             if is_global_search:
                 current_bias_y, current_bias_x = float(com_offsets[i, 0]), float(com_offsets[i, 1])
                 current_angle = 0.0
@@ -286,7 +293,7 @@ def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diamete
 # =============================================================================
 # [Engine 2] Parallel Implementation (CPU Multiprocessing)
 # =============================================================================
-def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diameter=None, n_jobs=-1):
+def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diameter=None, n_jobs=-1, verbose=True):
     """Parallelized Alignment Driver (improved pickling efficiency)."""
 
     # Determine workers
@@ -296,19 +303,19 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
     else:
         num_workers = min(int(n_jobs), max_cores)
 
-    print(f">> Mode: Parallel CPU (Workers={num_workers})")
+    _vprint(verbose, f">> Mode: Parallel CPU (Workers={num_workers})")
 
     N, H, W = X.shape
     geo = au.get_geometry_context((H, W))
 
     # 1) CoM in parallel (initializer avoids sending geo per task)
-    print("   [Step 0] Parallel CoM Calculation...")
+    _vprint(verbose, "   [Step 0] Parallel CoM Calculation...")
     with multiprocessing.Pool(
         processes=num_workers,
         initializer=_init_worker_com,
         initargs=(geo, 5),
     ) as pool:
-        results = list(tqdm(pool.imap(_worker_calc_com, X, chunksize=10), total=N, desc="   CoM"))
+        results = list(tqdm(pool.imap(_worker_calc_com, X, chunksize=10), total=N, desc="   CoM", disable=not verbose))
 
     com_offsets = np.asarray(results, dtype=np.float32)
 
@@ -320,29 +327,29 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
     # 3) Iterations
     for it in range(num_iterations):
         lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
-        print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
+        _vprint(verbose, f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
 
         ref_match = au.apply_lowpass_filter(current_ref, sigma=lp_sigma)
 
-        # Prepare tasks (small tuples only; geo/ref are globals in workers)
-        tasks = []
-        if is_global_search:
-            # state params unused in global search, but keep task format consistent
-            for i in range(N):
-                tasks.append((
-                    i,
-                    X[i],
-                    0.0, 0.0, 0.0,                  # param_angle, param_dy, param_dx
-                    float(com_offsets[i, 0]), float(com_offsets[i, 1]),
-                ))
-        else:
-            for i in range(N):
-                tasks.append((
-                    i,
-                    X[i],
-                    float(state_params[i, 0]), float(state_params[i, 1]), float(state_params[i, 2]),
-                    float(com_offsets[i, 0]), float(com_offsets[i, 1]),
-                ))
+        # Prepare tasks lazily to reduce peak memory footprint.
+        def _iter_tasks():
+            if is_global_search:
+                # state params unused in global search, but keep task format consistent
+                for i in range(N):
+                    yield (
+                        i,
+                        X[i],
+                        0.0, 0.0, 0.0,                  # param_angle, param_dy, param_dx
+                        float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                    )
+            else:
+                for i in range(N):
+                    yield (
+                        i,
+                        X[i],
+                        float(state_params[i, 0]), float(state_params[i, 1]), float(state_params[i, 2]),
+                        float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                    )
 
         ref_accumulator = np.zeros((H, W), dtype=np.float32)
         scores_sum = 0.0
@@ -353,8 +360,8 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
             initializer=_init_worker_align,
             initargs=(geo, ref_match, mask_diameter, lp_sigma, is_global_search, search_range, search_step),
         ) as pool:
-            iterator = pool.imap(_worker_align_particle, tasks, chunksize=5)
-            for idx, new_params, aligned_img in tqdm(iterator, total=N, desc="   Aligning"):
+            iterator = pool.imap(_worker_align_particle, _iter_tasks(), chunksize=5)
+            for idx, new_params, aligned_img in tqdm(iterator, total=N, desc="   Aligning", disable=not verbose):
                 state_params[idx] = new_params
                 ref_accumulator += aligned_img
                 scores_sum += float(new_params[3])
@@ -377,9 +384,10 @@ def run_batch_alignment_gpu(
     mask_diameter=None,
     batch_size=4096,
     profile_gpu=False,
+    verbose=True,
 ):
     """ GPU Alignment Driver using align_utils_gpu """
-    print(f">> Mode: GPU Accelerated (CuPy), Batch Size={batch_size}")
+    _vprint(verbose, f">> Mode: GPU Accelerated (CuPy), Batch Size={batch_size}")
     
     # Init GPU resources
     N, H, W = X_cpu.shape
@@ -402,7 +410,7 @@ def run_batch_alignment_gpu(
     profile = {"h2d_ms": [], "compute_ms": [], "d2h_ms": [], "e2e_ms": []} if profile_gpu else None
     
     # 1. CoM Batch
-    print("   [Step 0] GPU CoM Calculation...")
+    _vprint(verbose, "   [Step 0] GPU CoM Calculation...")
     com_host_buffers = [
         pinned_pool.get((batch_size, 2), dtype=np.float32),
         pinned_pool.get((batch_size, 2), dtype=np.float32),
@@ -417,7 +425,7 @@ def run_batch_alignment_gpu(
             _async_h2d(d_img_buffers[0][:bs0], h_stage0[:bs0], stream_copy)
             ev_h2d_done[0].record(stream_copy)
 
-    for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   CoM")):
+    for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   CoM", disable=not verbose)):
         buf = bi % 2
         curr_bs = end_idx - start_idx
 
@@ -459,7 +467,7 @@ def run_batch_alignment_gpu(
     for it in range(num_iterations):
         lp_sigma, is_global_search, search_range, search_step = iter_params(it, num_iterations)
         
-        print(f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
+        _vprint(verbose, f"   [Iter {it+1}/{num_iterations}] Global={is_global_search}, LP={lp_sigma}")
         
         ref_masked = aug.get_circular_mask(geo, diameter=mask_diameter) * current_ref_gpu
         ref_match = aug.apply_lowpass_batch(ref_masked, sigma=lp_sigma)
@@ -479,7 +487,7 @@ def run_batch_alignment_gpu(
                 _async_h2d(d_img_buffers[0][:bs0], h_stage0[:bs0], stream_copy)
                 ev_h2d_done[0].record(stream_copy)
 
-        for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   Aligning")):
+        for bi, (start_idx, end_idx) in enumerate(tqdm(batch_ranges, desc="   Aligning", disable=not verbose)):
             buf = bi % 2
             curr_bs = end_idx - start_idx
 
@@ -598,7 +606,7 @@ def run_batch_alignment_gpu(
 # [Main API] The Unified Interface
 # =============================================================================
 def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None, 
-                  use_gpu=False, n_jobs=None, batch_size=4096, profile_gpu=False):
+                  use_gpu=False, n_jobs=None, batch_size=4096, profile_gpu=False, verbose=True):
     """
     Unified entry point for 2D Alignment.
     
@@ -613,6 +621,7 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                       None or -1 = Use all available cores (Parallel).
         batch_size (int): Batch size for GPU processing.
         profile_gpu (bool): Collect lightweight CUDA event timings for GPU execution.
+        verbose (bool): If False, suppresses progress bars and runtime logs.
 
     Returns:
         final_ref (np.ndarray): Aligned reference.
@@ -642,14 +651,15 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                     mask_diameter=mask_diameter,
                     batch_size=batch_size,
                     profile_gpu=profile_gpu,
+                    verbose=verbose,
                 )
                 engine = "gpu"
             except Exception as e:
-                print(f"\n[WARNING] GPU execution failed: {e}")
-                print("Switching to CPU mode automatically...\n")
+                _vprint(verbose, f"\n[WARNING] GPU execution failed: {e}")
+                _vprint(verbose, "Switching to CPU mode automatically...\n")
         else:
-            print("\n[WARNING] GPU requested but 'cupy' or 'align_utils_gpu' not found.")
-            print("Switching to CPU mode automatically...\n")
+            _vprint(verbose, "\n[WARNING] GPU requested but 'cupy' or 'align_utils_gpu' not found.")
+            _vprint(verbose, "Switching to CPU mode automatically...\n")
             
     # 2. CPU Logic (Dispatch based on n_jobs)
     if engine != "gpu":
@@ -657,7 +667,8 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
             final_ref, history, params, com_offsets = run_stateful_alignment_serial(
                 X, initial_ref, 
                 num_iterations=num_iterations, 
-                mask_diameter=mask_diameter
+                mask_diameter=mask_diameter,
+                verbose=verbose,
             )
             engine = "cpu-serial"
         else:
@@ -666,7 +677,8 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                 X, initial_ref, 
                 num_iterations=num_iterations, 
                 mask_diameter=mask_diameter,
-                n_jobs=n_jobs
+                n_jobs=n_jobs,
+                verbose=verbose,
             )
             engine = "cpu-parallel"
 
