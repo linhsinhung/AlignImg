@@ -48,9 +48,10 @@ class _PinnedHostBufferPool:
         if key not in self._buffers:
             if len(self._buffers) >= self.capacity:
                 self._buffers.pop(next(iter(self._buffers)))
-            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            count = int(np.prod(shape))
+            nbytes = count * np.dtype(dtype).itemsize
             pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
-            host_view = np.frombuffer(pinned_mem, dtype=dtype).reshape(shape)
+            host_view = np.frombuffer(pinned_mem, dtype=dtype, count=count).reshape(shape)
             self._buffers[key] = (pinned_mem, host_view)
         return self._buffers[key][1]
 
