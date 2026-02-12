@@ -67,7 +67,8 @@ final_ref, history, params, meta = run_alignment(
     initial_ref,
     num_iterations=4,
     use_gpu=True,
-    batch_size=512
+    batch_size=512,
+    profile_gpu=True
 )
 ```
 
@@ -80,7 +81,8 @@ final_ref, history, params, meta = run_alignment(
   - `mask_diameter`: circular mask diameter in pixels (or `None` for full image).
   - `use_gpu`: enable GPU processing (requires CuPy; otherwise falls back to CPU).
   - `n_jobs`: number of CPU workers (`1` for serial, `None`/`-1` for all cores).
-  - `batch_size`: GPU batch size.
+  - `batch_size`: GPU batch size (recommended starting point on Linux servers: `batch_size=4096`, then tune with `profile_gpu=True`).
+  - `profile_gpu`: if `True` in GPU mode, reports CUDA event timing summary in `meta["gpu_profile"]`.
 
 - **Outputs**
   - `final_ref`: the aligned reference image.
@@ -102,3 +104,33 @@ final_ref, history, params, meta = run_alignment(X, gt)
 - AlignImg is designed for cryo-EM 2D particle stacks but can be used with any 2D image stacks of the same size.
 - CPU parallel execution is used by default; set `n_jobs=1` for single-core behavior.
 - GPU acceleration is optional and auto-fallbacks to CPU if CuPy is not installed.
+
+
+## Minimal GPU benchmark
+
+Use this command to compare throughput before/after changes (adjust to your GPU memory):
+
+```bash
+python - <<'PY'
+import time
+import numpy as np
+from alignimg_api import run_alignment
+
+rng = np.random.default_rng(0)
+N, H, W = 1024, 128, 128
+X = rng.normal(size=(N, H, W)).astype(np.float32)
+init_ref = X.mean(axis=0).astype(np.float32)
+
+t0 = time.perf_counter()
+_, _, _, meta = run_alignment(
+    X,
+    init_ref,
+    num_iterations=2,
+    use_gpu=True,
+    batch_size=256,
+    profile_gpu=True,
+)
+print(f"elapsed_s={time.perf_counter() - t0:.3f}")
+print(meta.get("gpu_profile", {}))
+PY
+```
