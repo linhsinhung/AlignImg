@@ -348,7 +348,8 @@ def write_candidate_diagnostics_csv(path: Path, diagnostics: list[dict], gt_tabl
         return
     headers = [
         "iteration", "particle", "candidate_rank", "candidate_angle_deg", "coarse_angle_deg",
-        "candidate_score", "candidate_weight", "selected_angle_deg", "ideal_angle_deg", "selected_rank",
+        "candidate_score", "candidate_weight", "max_candidate_weight", "entropy_candidate_weight",
+        "selected_angle_deg", "ideal_angle_deg", "selected_rank",
     ]
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -367,6 +368,8 @@ def write_candidate_diagnostics_csv(path: Path, diagnostics: list[dict], gt_tabl
                     f"{float(coarse[rank]) if rank < coarse.size else float(angle):.6f}",
                     f"{float(scores[rank]) if rank < scores.size else np.nan:.6f}",
                     f"{float(weights[rank]) if rank < weights.size else np.nan:.6f}",
+                    f"{float(diag.get('max_candidate_weight', np.nan)):.6f}",
+                    f"{float(diag.get('entropy_candidate_weight', np.nan)):.6f}",
                     f"{float(diag.get('selected_angle', np.nan)):.6f}",
                     f"{ideal:.6f}",
                     int(diag.get("selected_rank", 0)),
@@ -415,6 +418,57 @@ def plot_selected_rank_histogram(output_path: Path, diagnostics_by_method: dict[
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
+
+def run_legacy_k1_parity_check(
+    stack: np.ndarray,
+    init_ref: np.ndarray,
+    num_iterations: int,
+    mask_diameter: float,
+    output_dir: Path,
+    tolerance: float,
+    verbose: bool,
+) -> None:
+    """Confirm legacy mode and multicandidate K=1/hard mode are identical."""
+    legacy_ref, _legacy_hist, legacy_params, _legacy_meta = api.run_alignment(
+        stack,
+        init_ref,
+        num_iterations=num_iterations,
+        mask_diameter=mask_diameter,
+        use_gpu=False,
+        n_jobs=1,
+        verbose=verbose,
+        use_multicandidate=False,
+    )
+    k1_ref, _k1_hist, k1_params, _k1_meta = api.run_alignment(
+        stack,
+        init_ref,
+        num_iterations=num_iterations,
+        mask_diameter=mask_diameter,
+        use_gpu=False,
+        n_jobs=1,
+        verbose=verbose,
+        use_multicandidate=True,
+        topk_initial=1,
+        anneal_multicandidate=True,
+    )
+
+    params_max_abs = float(np.max(np.abs(legacy_params - k1_params)))
+    ref_max_abs = float(np.max(np.abs(legacy_ref - k1_ref)))
+    passed = params_max_abs <= tolerance and ref_max_abs <= tolerance
+
+    path = output_dir / "legacy_k1_parity_check.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["params_max_abs", "ref_max_abs", "tolerance", "passed"])
+        writer.writerow([f"{params_max_abs:.9g}", f"{ref_max_abs:.9g}", f"{tolerance:.9g}", int(passed)])
+
+    status = "PASS" if passed else "FAIL"
+    print(
+        f"Legacy K=1 parity check: {status} "
+        f"(params_max_abs={params_max_abs:.3g}, ref_max_abs={ref_max_abs:.3g}, tol={tolerance:.3g})"
+    )
+
+
 def available_methods(requested: str) -> list[MethodConfig]:
     method_map = {
         "cpu-serial": MethodConfig("cpu-serial", use_gpu=False, n_jobs=1),
@@ -449,6 +503,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translation-only", action="store_true", help="Set max_angle=0 and evaluate shift recovery separately.")
     parser.add_argument("--rotation-only", action="store_true", help="Set max_shift=0 and evaluate rotation recovery separately.")
     parser.add_argument("--diagnostics-n", type=int, default=20, help="Number of particles for candidate diagnostics.")
+    parser.add_argument("--check-legacy-k1", action="store_true", help="Run a serial parity check for legacy vs multicandidate K=1 hard mode.")
+    parser.add_argument("--legacy-k1-tol", type=float, default=1e-6, help="Tolerance for --check-legacy-k1.")
     return parser.parse_args()
 
 
@@ -486,6 +542,17 @@ def main() -> None:
     else:
         print("End-to-end raw-average mode: GT pose comparison is strict and may include global reference-frame ambiguity.")
     write_ground_truth_csv(output_dir / "ground_truth_params.csv", gt_table)
+
+    if args.check_legacy_k1:
+        run_legacy_k1_parity_check(
+            stack=stack,
+            init_ref=init_ref,
+            num_iterations=args.iterations,
+            mask_diameter=mask_diameter,
+            output_dir=output_dir,
+            tolerance=args.legacy_k1_tol,
+            verbose=args.verbose,
+        )
 
     methods = available_methods(args.methods)
     if args.use_multicandidate:

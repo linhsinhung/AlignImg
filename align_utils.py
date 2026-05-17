@@ -157,6 +157,44 @@ def _angle_from_fm_profile_index(index: int, geo: GeometryContext) -> float:
     return normalize_angle(angle_est)
 
 
+def _valid_fm_lag_indices(geo: GeometryContext, profile_size: int | None = None) -> np.ndarray:
+    """Indices that correspond to real linear-correlation lags, not padding.
+
+    The 1D Fourier-Mellin profile is computed with zero-padding to fft_len, so
+    the middle bins do not represent valid lags.  Only lags 0..H-1 and
+    -(H-1)..-1 are valid for the original angular profile length H.
+    """
+    fft_len = geo.prof_fft_len if profile_size is None else int(profile_size)
+    h = int(geo.H)
+    pos = np.arange(0, min(h, fft_len), dtype=np.int64)
+    neg_start = max(0, fft_len - (h - 1))
+    neg = np.arange(neg_start, fft_len, dtype=np.int64)
+    return np.concatenate((pos, neg))
+
+
+def _separate_normalized_angles(angles, K: int | None = None, min_separation_deg=15) -> np.ndarray:
+    """Normalize angles, remove duplicates, and enforce circular separation."""
+    selected: list[float] = []
+    min_sep = float(min_separation_deg)
+    limit = None if K is None else int(K)
+    for angle in np.asarray(angles, dtype=np.float32).ravel():
+        norm_angle = normalize_angle(float(angle))
+        if all(abs(normalize_angle(norm_angle - prev)) >= min_sep for prev in selected):
+            selected.append(norm_angle)
+            if limit is not None and len(selected) >= limit:
+                break
+    return np.asarray(selected, dtype=np.float32)
+
+
+def expand_angles_with_180_ambiguity(candidate_angles, min_separation_deg=15) -> np.ndarray:
+    """Include the standard 180-degree FM ambiguity for every candidate angle."""
+    expanded: list[float] = []
+    for angle in np.asarray(candidate_angles, dtype=np.float32).ravel():
+        expanded.append(float(angle))
+        expanded.append(float(angle) + 180.0)
+    return _separate_normalized_angles(expanded, K=None, min_separation_deg=min_separation_deg)
+
+
 def get_coarse_angle_fourier_mellin_profile(img: np.ndarray, ref: np.ndarray, geo: GeometryContext):
     """
     Coarse rotation estimate plus full Fourier-Mellin angular score profile.
@@ -198,7 +236,9 @@ def get_coarse_angle_fourier_mellin_profile(img: np.ndarray, ref: np.ndarray, ge
     fp_ref = np.fft.fft(prof_ref_pad, n=fft_len)
 
     corr = np.real(np.fft.ifft(fp_img * np.conj(fp_ref))).astype(np.float32, copy=False)
-    shift_idx = int(np.argmax(corr))
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=corr.size)
+    valid_idx = valid_idx[valid_idx < corr.size]
+    shift_idx = int(valid_idx[np.argmax(corr[valid_idx])])
     return _angle_from_fm_profile_index(shift_idx, geo), corr
 
 
@@ -211,35 +251,36 @@ def get_coarse_angle_fourier_mellin(img: np.ndarray, ref: np.ndarray, geo: Geome
 def find_topk_angle_peaks_from_profile(profile, geo: GeometryContext, K=5, min_separation_deg=15):
     """Return top-K separated Fourier-Mellin peak angles in [-180, 180).
 
-    Peaks are selected from the angular correlation landscape without assuming
-    any special symmetry (no hard-coded 60/90/120 degree branches).  A circular
-    angular separation filter prevents near-duplicate bins from consuming K.
+    Peaks are selected from valid linear-correlation lag bins only:
+    ``0..H-1`` and ``fft_len-(H-1)..fft_len-1``.  The zero-padded middle of
+    the FFT correlation array is intentionally ignored because those bins do not
+    correspond to possible angular lags.  No special symmetry angles are
+    assumed; separation only prevents near-duplicate candidates.
     """
     prof = np.asarray(profile, dtype=np.float32).ravel()
     if prof.size == 0 or K <= 0:
         return np.empty(0, dtype=np.float32)
 
-    left = np.roll(prof, 1)
-    right = np.roll(prof, -1)
-    peak_idx = np.flatnonzero((prof >= left) & (prof >= right) & np.isfinite(prof))
-    if peak_idx.size == 0:
-        peak_idx = np.flatnonzero(np.isfinite(prof))
-    if peak_idx.size == 0:
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=prof.size)
+    valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < prof.size)]
+    valid_idx = valid_idx[np.isfinite(prof[valid_idx])]
+    if valid_idx.size == 0:
         return np.array([0.0], dtype=np.float32)
 
-    order = peak_idx[np.argsort(prof[peak_idx])[::-1]]
-    selected: list[float] = []
-    min_sep = float(min_separation_deg)
-    for idx in order:
-        angle = _angle_from_fm_profile_index(int(idx), geo)
-        if all(abs(normalize_angle(angle - prev)) >= min_sep for prev in selected):
-            selected.append(angle)
-            if len(selected) >= int(K):
-                break
+    valid_scores = prof[valid_idx]
+    left = np.roll(valid_scores, 1)
+    right = np.roll(valid_scores, -1)
+    peak_pos = np.flatnonzero((valid_scores >= left) & (valid_scores >= right))
+    peak_idx = valid_idx[peak_pos] if peak_pos.size else valid_idx
 
-    if not selected:
-        selected.append(_angle_from_fm_profile_index(int(np.argmax(prof)), geo))
-    return np.asarray(selected, dtype=np.float32)
+    order = peak_idx[np.argsort(prof[peak_idx])[::-1]]
+    ordered_angles = [_angle_from_fm_profile_index(int(idx), geo) for idx in order]
+    selected = _separate_normalized_angles(ordered_angles, K=K, min_separation_deg=min_separation_deg)
+
+    if selected.size == 0:
+        best_idx = int(valid_idx[np.argmax(prof[valid_idx])])
+        selected = np.array([_angle_from_fm_profile_index(best_idx, geo)], dtype=np.float32)
+    return selected
 
 
 def get_topk_coarse_angles_fourier_mellin(img: np.ndarray, ref: np.ndarray, geo: GeometryContext, K=5, min_separation_deg=15):
@@ -249,16 +290,26 @@ def get_topk_coarse_angles_fourier_mellin(img: np.ndarray, ref: np.ndarray, geo:
 
 
 def softmax_scores(scores, temperature):
-    """Numerically stable float32 softmax for candidate alignment scores."""
+    """Candidate-relative, scale-normalized softmax for alignment scores.
+
+    Raw FFT correlation magnitudes can vary substantially by image/reference,
+    so the score differences are divided by the candidate-set standard
+    deviation before applying the annealing temperature.  This makes
+    temperature meaningful across particles while remaining purely relative to
+    the candidate branches being compared for one particle.
+    """
     scores = np.asarray(scores, dtype=np.float32)
     if scores.size == 0:
         return np.empty(0, dtype=np.float32)
     finite = np.isfinite(scores)
     if not np.any(finite):
         return np.full(scores.shape, 1.0 / float(scores.size), dtype=np.float32)
+
     safe_scores = np.where(finite, scores, np.min(scores[finite]))
+    centered = safe_scores - np.max(safe_scores)
+    scale = float(np.std(safe_scores[finite])) + 1e-6
     temp = max(float(temperature), 1e-6)
-    logits = (safe_scores - np.max(safe_scores)) / temp
+    logits = centered / (temp * scale)
     logits = np.clip(logits, -80.0, 80.0)
     weights = np.exp(logits).astype(np.float32)
     total = float(np.sum(weights))
@@ -463,9 +514,17 @@ def align_one_cpu_multicandidate(
         # C) Fourier-Mellin proposes orientation branches; local alternatives
         # keep later annealed iterations near the previous best state.
         if use_fm_candidates:
-            candidate_angles = get_topk_coarse_angles_fourier_mellin(img_for_matching, ref_match, geo, K=K)
+            fm_angles = get_topk_coarse_angles_fourier_mellin(img_for_matching, ref_match, geo, K=K)
+            # Preserve the basic Fourier-Mellin 180-degree ambiguity handling for
+            # every branch.  This is not a hard-coded symmetry model; it simply
+            # gives image-space scoring both FM-equivalent orientations to verify.
+            candidate_angles = expand_angles_with_180_ambiguity(fm_angles, min_separation_deg=15)
             if (not is_global_search) and current_angle is not None:
-                candidate_angles = np.concatenate((np.array([current_angle], dtype=np.float32), candidate_angles))[:K]
+                candidate_angles = _separate_normalized_angles(
+                    np.concatenate((np.array([current_angle], dtype=np.float32), candidate_angles)),
+                    K=None,
+                    min_separation_deg=15,
+                )
         else:
             candidate_angles = _local_candidate_angles(current_angle, K, search_range)
 
@@ -473,7 +532,9 @@ def align_one_cpu_multicandidate(
         candidates = fine_alignment_search_candidates(
             img_for_matching, ref_match, candidate_angles, geo,
             search_range=search_range, step=search_step,
-        )[:K]
+        )
+        if not use_fm_candidates:
+            candidates = candidates[:K]
         weights = softmax_scores([c["score"] for c in candidates], temperature) if (soft and len(candidates) > 1) else np.eye(1, len(candidates), 0, dtype=np.float32).ravel()
 
     best = candidates[0]
@@ -513,11 +574,14 @@ def align_one_cpu_multicandidate(
     if not return_diagnostics:
         return new_params, weighted_aligned_img
 
+    weight_entropy = -float(np.sum(weights * np.log(np.maximum(weights, 1e-12)))) if weights.size else 0.0
     diag = {
         "candidate_angles": np.asarray([c["angle"] for c in candidates], dtype=np.float32),
         "coarse_angles": np.asarray([c.get("coarse_angle", c["angle"]) for c in candidates], dtype=np.float32),
         "candidate_scores": np.asarray([c["score"] for c in candidates], dtype=np.float32),
         "candidate_weights": weights.astype(np.float32, copy=False),
+        "max_candidate_weight": np.float32(np.max(weights) if weights.size else 1.0),
+        "entropy_candidate_weight": np.float32(weight_entropy),
         "selected_rank": int(candidates[0].get("input_rank", 0)),
         "selected_angle": np.float32(best_angle),
     }

@@ -180,10 +180,10 @@ def _worker_align_particle(task):
     """
     Worker: Align a single particle (CPU Parallel).
 
-    task = (idx, img, param_angle, param_dy, param_dx, com_dy, com_dx)
+    task = (idx, img, param_angle, param_dy, param_dx, com_dy, com_dx, want_diag)
     Uses globals initialized by _init_worker_align.
     """
-    idx, img, param_angle, param_dy, param_dx, com_dy, com_dx = task
+    idx, img, param_angle, param_dy, param_dx, com_dy, com_dx, want_diag = task
 
     # Determine current bias/angle
     if _IS_GLOBAL:
@@ -209,9 +209,9 @@ def _worker_align_particle(task):
         temperature=_TEMPERATURE,
         use_fm_candidates=_USE_FM_CANDIDATES,
         soft=_SOFT,
-        return_diagnostics=_RETURN_DIAGNOSTICS,
+        return_diagnostics=bool(want_diag),
     )
-    if _RETURN_DIAGNOSTICS:
+    if want_diag:
         new_params, aligned_img, diag = result
         return idx, new_params, aligned_img, diag
     new_params, aligned_img = result
@@ -222,6 +222,9 @@ def _worker_align_particle(task):
 # =============================================================================
 def orientation_schedule(it: int, num_iterations: int, topk_initial: int = 5, anneal_multicandidate: bool = True):
     """Annealed top-K orientation schedule for CPU multi-candidate alignment."""
+    if int(topk_initial) <= 1:
+        return dict(K=1, temperature=0.1, use_fm_candidates=(it == 0), soft=False,
+                    search_range=None, search_step=None)
     if not anneal_multicandidate:
         return dict(K=max(1, int(topk_initial)), temperature=1.0, use_fm_candidates=(it == 0), soft=True,
                     search_range=None, search_step=None)
@@ -398,6 +401,7 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
                         X[i],
                         0.0, 0.0, 0.0,                  # param_angle, param_dy, param_dx
                         float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                        i < int(diagnostics_n),
                     )
             else:
                 for i in range(N):
@@ -406,6 +410,7 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
                         X[i],
                         float(state_params[i, 0]), float(state_params[i, 1]), float(state_params[i, 2]),
                         float(com_offsets[i, 0]), float(com_offsets[i, 1]),
+                        i < int(diagnostics_n),
                     )
 
         ref_accumulator = np.zeros((H, W), dtype=np.float32)
@@ -416,17 +421,16 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
             processes=num_workers,
             initializer=_init_worker_align,
             initargs=(geo, ref_match, mask_diameter, lp_sigma, is_global_search, search_range, search_step,
-                      sched["K"], sched["temperature"], sched["use_fm_candidates"], sched["soft"], diagnostics_n > 0),
+                      sched["K"], sched["temperature"], sched["use_fm_candidates"], sched["soft"], False),
         ) as pool:
             iterator = pool.imap(_worker_align_particle, _iter_tasks(), chunksize=5)
             for item in tqdm(iterator, total=N, desc="   Aligning", disable=not verbose):
-                if diagnostics_n > 0:
+                if len(item) == 4:
                     idx, new_params, aligned_img, diag = item
-                    if idx < int(diagnostics_n):
-                        diag = dict(diag)
-                        diag["iteration"] = it
-                        diag["particle"] = idx
-                        candidate_diagnostics.append(diag)
+                    diag = dict(diag)
+                    diag["iteration"] = it
+                    diag["particle"] = idx
+                    candidate_diagnostics.append(diag)
                 else:
                     idx, new_params, aligned_img = item
                 state_params[idx] = new_params
