@@ -33,6 +33,7 @@ class MethodConfig:
     name: str
     use_gpu: bool
     n_jobs: int | None
+    use_multicandidate: bool = False
 
 
 @dataclass
@@ -340,6 +341,80 @@ def plot_parameter_scatter(output_path: Path, gt_table: np.ndarray, results: lis
     plt.close(fig)
 
 
+
+def write_candidate_diagnostics_csv(path: Path, diagnostics: list[dict], gt_table: np.ndarray) -> None:
+    """Save candidate branch diagnostics for a small particle subset."""
+    if not diagnostics:
+        return
+    headers = [
+        "iteration", "particle", "candidate_rank", "candidate_angle_deg", "coarse_angle_deg",
+        "candidate_score", "candidate_weight", "selected_angle_deg", "ideal_angle_deg", "selected_rank",
+    ]
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for diag in diagnostics:
+            particle = int(diag["particle"])
+            ideal = float(gt_table[particle, 3])
+            angles = np.asarray(diag.get("candidate_angles", []), dtype=np.float32)
+            coarse = np.asarray(diag.get("coarse_angles", angles), dtype=np.float32)
+            scores = np.asarray(diag.get("candidate_scores", []), dtype=np.float32)
+            weights = np.asarray(diag.get("candidate_weights", []), dtype=np.float32)
+            for rank, angle in enumerate(angles):
+                writer.writerow([
+                    int(diag.get("iteration", -1)), particle, rank,
+                    f"{float(angle):.6f}",
+                    f"{float(coarse[rank]) if rank < coarse.size else float(angle):.6f}",
+                    f"{float(scores[rank]) if rank < scores.size else np.nan:.6f}",
+                    f"{float(weights[rank]) if rank < weights.size else np.nan:.6f}",
+                    f"{float(diag.get('selected_angle', np.nan)):.6f}",
+                    f"{ideal:.6f}",
+                    int(diag.get("selected_rank", 0)),
+                ])
+
+
+def plot_angle_error_comparison(output_path: Path, results: list[MethodResult]) -> None:
+    if len(results) < 1:
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for result in results:
+        ax.hist(result.particle_metrics["angle_error_deg"], bins=48, alpha=0.45, label=result.name)
+    ax.set_xlabel("Signed angle error (deg)")
+    ax.set_ylabel("Particles")
+    ax.set_title("Angle error branch structure")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_selected_rank_histogram(output_path: Path, diagnostics_by_method: dict[str, list[dict]]) -> None:
+    if not diagnostics_by_method:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    labels = []
+    data = []
+    for name, diagnostics in diagnostics_by_method.items():
+        ranks = [int(d.get("selected_rank", 0)) for d in diagnostics]
+        if ranks:
+            labels.append(name)
+            data.append(ranks)
+    if not data:
+        plt.close(fig)
+        return
+    bins = np.arange(0, max(max(r) for r in data) + 2) - 0.5
+    for ranks, label in zip(data, labels):
+        ax.hist(ranks, bins=bins, alpha=0.5, label=label)
+    ax.set_xlabel("Selected candidate rank after image-space scoring")
+    ax.set_ylabel("Particle/iteration diagnostics")
+    ax.set_title("Selected candidate rank histogram")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
 def available_methods(requested: str) -> list[MethodConfig]:
     method_map = {
         "cpu-serial": MethodConfig("cpu-serial", use_gpu=False, n_jobs=1),
@@ -368,6 +443,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="accuracy_report", help="Directory for CSV and PNG outputs.")
     parser.add_argument("--gpu-batch-size", type=int, default=256, help="Batch size for GPU method.")
     parser.add_argument("--verbose", action="store_true", help="Show run_alignment progress output.")
+    parser.add_argument("--use-multicandidate", action="store_true", help="Enable annealed top-K orientation candidates.")
+    parser.add_argument("--topk-initial", type=int, default=5, help="Initial top-K orientation candidates.")
+    parser.add_argument("--oracle-ref", action="store_true", help="Use the ground-truth template as the initial reference.")
+    parser.add_argument("--translation-only", action="store_true", help="Set max_angle=0 and evaluate shift recovery separately.")
+    parser.add_argument("--rotation-only", action="store_true", help="Set max_shift=0 and evaluate rotation recovery separately.")
+    parser.add_argument("--diagnostics-n", type=int, default=20, help="Number of particles for candidate diagnostics.")
     return parser.parse_args()
 
 
@@ -375,6 +456,13 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.translation_only and args.rotation_only:
+        raise ValueError("--translation-only and --rotation-only are mutually exclusive")
+    if args.translation_only:
+        args.max_angle = 0.0
+    if args.rotation_only:
+        args.max_shift = 0.0
 
     mask_diameter = args.mask_diameter if args.mask_diameter is not None else args.size * 0.82
     geo = au.get_geometry_context((args.size, args.size))
@@ -388,11 +476,31 @@ def main() -> None:
         max_angle=args.max_angle,
         seed=args.seed,
     )
-    init_ref = np.mean(stack, axis=0).astype(np.float32)
+    init_ref = gt_img.astype(np.float32, copy=True) if args.oracle_ref else np.mean(stack, axis=0).astype(np.float32)
+    if args.oracle_ref:
+        print("Using oracle ground-truth initial reference.")
+    if args.translation_only:
+        print("Translation-only mode: max_angle forced to 0.")
+    elif args.rotation_only:
+        print("Rotation-only mode: max_shift forced to 0.")
+    else:
+        print("End-to-end raw-average mode: GT pose comparison is strict and may include global reference-frame ambiguity.")
     write_ground_truth_csv(output_dir / "ground_truth_params.csv", gt_table)
 
+    methods = available_methods(args.methods)
+    if args.use_multicandidate:
+        expanded_methods: list[MethodConfig] = []
+        for method in methods:
+            if method.use_gpu:
+                expanded_methods.append(method)
+            else:
+                expanded_methods.append(MethodConfig(f"{method.name}-single", method.use_gpu, method.n_jobs, False))
+                expanded_methods.append(MethodConfig(f"{method.name}-multicandidate", method.use_gpu, method.n_jobs, True))
+        methods = expanded_methods
+
     results: list[MethodResult] = []
-    for method in available_methods(args.methods):
+    diagnostics_by_method: dict[str, list[dict]] = {}
+    for method in methods:
         print(f"\n=== Running {method.name} ===")
         start = time.perf_counter()
         final_ref, _history, params, meta = api.run_alignment(
@@ -404,6 +512,9 @@ def main() -> None:
             n_jobs=method.n_jobs,
             batch_size=args.gpu_batch_size,
             verbose=args.verbose,
+            use_multicandidate=method.use_multicandidate and not method.use_gpu,
+            topk_initial=args.topk_initial,
+            diagnostics_n=args.diagnostics_n if (method.use_multicandidate and not method.use_gpu) else 0,
         )
         elapsed = time.perf_counter() - start
         corrected = api.run_transform(stack, params, engine=meta["engine"])
@@ -419,6 +530,10 @@ def main() -> None:
             meta["engine"],
         )
         results.append(result)
+        diagnostics = meta.get("candidate_diagnostics", [])
+        if diagnostics:
+            diagnostics_by_method[method.name] = diagnostics
+            write_candidate_diagnostics_csv(output_dir / f"{method.name}_candidate_diagnostics.csv", diagnostics, gt_table)
         write_particle_csv(output_dir / f"{method.name}_particle_errors.csv", result, gt_table)
         print(
             f"{method.name}: engine={result.engine}, elapsed={elapsed:.2f}s, "
@@ -431,6 +546,8 @@ def main() -> None:
     plot_overview(output_dir / "overview.png", gt_img, stack, results)
     plot_error_distributions(output_dir / "error_distributions.png", results)
     plot_parameter_scatter(output_dir / "parameter_scatter.png", gt_table, results)
+    plot_angle_error_comparison(output_dir / "angle_error_comparison.png", results)
+    plot_selected_rank_histogram(output_dir / "selected_candidate_rank.png", diagnostics_by_method)
 
     print(f"\nWrote accuracy report to: {output_dir.resolve()}")
     print("Key files:")
@@ -438,6 +555,7 @@ def main() -> None:
     print(f"  - {output_dir / 'overview.png'}")
     print(f"  - {output_dir / 'error_distributions.png'}")
     print(f"  - {output_dir / 'parameter_scatter.png'}")
+    print(f"  - {output_dir / 'angle_error_comparison.png'}")
 
 
 if __name__ == "__main__":
