@@ -334,6 +334,114 @@ def get_best_translation_fft(img: np.ndarray, ref: np.ndarray, geo: GeometryCont
 
     return dy, dx, max_cc
 
+
+def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Return zero-mean normalized cross-correlation for two images."""
+    aa = np.asarray(a, dtype=np.float64) - float(np.mean(a))
+    bb = np.asarray(b, dtype=np.float64) - float(np.mean(b))
+    denom = np.sqrt(float(np.sum(aa * aa)) * float(np.sum(bb * bb)))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.sum(aa * bb) / denom)
+
+
+def joint_angle_translation_score(img: np.ndarray, ref: np.ndarray, geo: GeometryContext, angle: float):
+    """Score a correction angle jointly with its FFT-estimated translation.
+
+    ``get_best_translation_fft`` returns the observed displacement after applying
+    the candidate rotation, so the correction shift stored in the result is the
+    negated observed displacement.  The final score is measured in image space
+    on the fully corrected image, not from the raw FFT peak magnitude.
+    """
+    norm_angle = normalize_angle(float(angle))
+    rotated = rotate_image(img, geo, norm_angle)
+    obs_dy, obs_dx, fft_score = get_best_translation_fft(rotated, ref, geo)
+    corr_dy = -obs_dy
+    corr_dx = -obs_dx
+    corrected = transform_final_image(img, geo, norm_angle, corr_dy, corr_dx)
+    score = normalized_cross_correlation(corrected, ref)
+    return {
+        "angle": norm_angle,
+        "dy": float(corr_dy),
+        "dx": float(corr_dx),
+        "score": float(score),
+        "fft_score": float(fft_score),
+    }
+
+
+def _scan_joint_angles(img: np.ndarray, ref: np.ndarray, geo: GeometryContext, angles, seen: set[float] | None = None):
+    """Evaluate unique angles for coarse-to-fine joint image-space search."""
+    results = []
+    if seen is None:
+        seen = set()
+    for ang in angles:
+        norm_ang = normalize_angle(float(ang))
+        key = round(norm_ang, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(joint_angle_translation_score(img, ref, geo, norm_ang))
+    return results
+
+
+def coarse_to_fine_joint_search(
+    img: np.ndarray,
+    ref: np.ndarray,
+    geo: GeometryContext,
+    global_step=10.0,
+    mid_range=12.0,
+    mid_step=2.0,
+    fine_range=2.0,
+    fine_step=0.5,
+    topk=3,
+):
+    """Coarse-to-fine image-space joint rotation + translation search.
+
+    Stage 1 scans the full circle, Stage 2 refines each of the best coarse
+    branches, and Stage 3 performs a narrow scan around the best mid-stage
+    branch.  Candidate angles are scored only after FFT translation correction
+    and normalized cross-correlation against ``ref``.
+    """
+    topk = max(1, int(topk))
+    global_step = float(global_step)
+    mid_range = float(mid_range)
+    mid_step = float(mid_step)
+    fine_range = float(fine_range)
+    fine_step = float(fine_step)
+    if global_step <= 0.0 or mid_step <= 0.0 or fine_step <= 0.0:
+        raise ValueError("global_step, mid_step, and fine_step must be positive")
+
+    seen: set[float] = set()
+    all_candidates = []
+
+    # Stage 1: full-circle scan, -180 inclusive to 180 exclusive.
+    stage1_angles = np.arange(-180.0, 180.0, global_step, dtype=np.float32)
+    stage1 = _scan_joint_angles(img, ref, geo, stage1_angles, seen)
+    all_candidates.extend({**cand, "stage": 1} for cand in stage1)
+    top = sorted(stage1, key=lambda item: item["score"], reverse=True)[:topk]
+
+    # Stage 2: refine around the top global candidates.
+    stage2 = []
+    for cand in top:
+        center = float(cand["angle"])
+        angles = np.arange(center - mid_range, center + mid_range + 0.5 * mid_step, mid_step, dtype=np.float32)
+        stage2.extend(_scan_joint_angles(img, ref, geo, angles, seen))
+    all_candidates.extend({**cand, "stage": 2} for cand in stage2)
+    top = sorted(top + stage2, key=lambda item: item["score"], reverse=True)[:topk]
+
+    # Stage 3: fine scan around the best candidate from Stages 1/2.
+    best_center = float(top[0]["angle"]) if top else 0.0
+    fine_angles = np.arange(best_center - fine_range, best_center + fine_range + 0.5 * fine_step, fine_step, dtype=np.float32)
+    stage3 = _scan_joint_angles(img, ref, geo, fine_angles, seen)
+    all_candidates.extend({**cand, "stage": 3} for cand in stage3)
+
+    ranked = sorted(top + stage3, key=lambda item: item["score"], reverse=True)
+    best = dict(ranked[0] if ranked else joint_angle_translation_score(img, ref, geo, 0.0))
+    best["all_candidates"] = sorted(all_candidates, key=lambda item: item["score"], reverse=True)
+    best["n_evaluations"] = int(len(all_candidates))
+    return best
+
+
 def check_180_ambiguity(img: np.ndarray, ref: np.ndarray, angle_candidate: float, geo: GeometryContext):
     rot_1 = rotate_image(img, geo, angle_candidate)
     _, _, score_1 = get_best_translation_fft(rot_1, ref, geo)
@@ -475,6 +583,7 @@ def align_one_cpu_multicandidate(
     soft: bool = False,
     return_diagnostics: bool = False,
     legacy_single_candidate: bool = True,
+    coarse_angle_mode: str = "grid_joint",
 ):
     """Align one CPU particle with optional annealed top-K orientation branches.
 
@@ -484,6 +593,8 @@ def align_one_cpu_multicandidate(
     candidate images are generated one at a time and discarded.
     """
     K = max(1, int(K))
+    if coarse_angle_mode not in {"fm", "grid_joint"}:
+        raise ValueError("coarse_angle_mode must be 'fm' or 'grid_joint'")
 
     # Preserve the old alignment path as closely as possible for K=1/hard mode.
     if legacy_single_candidate and K == 1 and not soft:
@@ -491,16 +602,30 @@ def align_one_cpu_multicandidate(
         img_masked = apply_circular_mask(img_centered, geo, diameter=mask_diameter)
         img_for_matching = apply_lowpass_filter(img_masked, sigma=lp_sigma)
 
-        if is_global_search:
-            raw_angle = get_coarse_angle_fourier_mellin(img_for_matching, ref_match, geo)
-            center_angle, _ = check_180_ambiguity(img_for_matching, ref_match, raw_angle, geo)
+        if is_global_search and coarse_angle_mode == "grid_joint":
+            joint_best = coarse_to_fine_joint_search(img_for_matching, ref_match, geo)
+            # The joint search returns correction shifts; existing state-update
+            # math below expects the raw observed FFT residual, so negate here.
+            best = {
+                "angle": float(joint_best["angle"]),
+                "dy": float(-joint_best["dy"]),
+                "dx": float(-joint_best["dx"]),
+                "score": float(joint_best["score"]),
+                "fft_score": float(joint_best["fft_score"]),
+                "coarse_angle_mode": "grid_joint",
+                "n_evaluations": int(joint_best.get("n_evaluations", 0)),
+            }
         else:
-            center_angle = current_angle
+            if is_global_search:
+                raw_angle = get_coarse_angle_fourier_mellin(img_for_matching, ref_match, geo)
+                center_angle, _ = check_180_ambiguity(img_for_matching, ref_match, raw_angle, geo)
+            else:
+                center_angle = current_angle
 
-        best = fine_alignment_search(
-            img_for_matching, ref_match, center_angle, geo,
-            search_range=search_range, step=search_step,
-        )
+            best = fine_alignment_search(
+                img_for_matching, ref_match, center_angle, geo,
+                search_range=search_range, step=search_step,
+            )
         candidates = [best]
         weights = np.array([1.0], dtype=np.float32)
     else:
@@ -513,7 +638,18 @@ def align_one_cpu_multicandidate(
 
         # C) Fourier-Mellin proposes orientation branches; local alternatives
         # keep later annealed iterations near the previous best state.
-        if use_fm_candidates:
+        if is_global_search and coarse_angle_mode == "grid_joint":
+            joint_best = coarse_to_fine_joint_search(img_for_matching, ref_match, geo, topk=K)
+            candidates = [{
+                "angle": float(joint_best["angle"]),
+                "dy": float(-joint_best["dy"]),
+                "dx": float(-joint_best["dx"]),
+                "score": float(joint_best["score"]),
+                "fft_score": float(joint_best["fft_score"]),
+                "coarse_angle_mode": "grid_joint",
+                "n_evaluations": int(joint_best.get("n_evaluations", 0)),
+            }]
+        elif use_fm_candidates:
             fm_angles = get_topk_coarse_angles_fourier_mellin(img_for_matching, ref_match, geo, K=K)
             # Preserve the basic Fourier-Mellin 180-degree ambiguity handling for
             # every branch.  This is not a hard-coded symmetry model; it simply
@@ -529,12 +665,13 @@ def align_one_cpu_multicandidate(
             candidate_angles = _local_candidate_angles(current_angle, K, search_range)
 
         # D) Verify each branch by image-space fine alignment and translation score.
-        candidates = fine_alignment_search_candidates(
-            img_for_matching, ref_match, candidate_angles, geo,
-            search_range=search_range, step=search_step,
-        )
-        if not use_fm_candidates:
-            candidates = candidates[:K]
+        if not (is_global_search and coarse_angle_mode == "grid_joint"):
+            candidates = fine_alignment_search_candidates(
+                img_for_matching, ref_match, candidate_angles, geo,
+                search_range=search_range, step=search_step,
+            )
+            if not use_fm_candidates:
+                candidates = candidates[:K]
         weights = softmax_scores([c["score"] for c in candidates], temperature) if (soft and len(candidates) > 1) else np.eye(1, len(candidates), 0, dtype=np.float32).ravel()
 
     best = candidates[0]
@@ -584,5 +721,7 @@ def align_one_cpu_multicandidate(
         "entropy_candidate_weight": np.float32(weight_entropy),
         "selected_rank": int(candidates[0].get("input_rank", 0)),
         "selected_angle": np.float32(best_angle),
+        "coarse_angle_mode": candidates[0].get("coarse_angle_mode", coarse_angle_mode),
+        "coarse_angle_evaluations": int(candidates[0].get("n_evaluations", 0)),
     }
     return new_params, weighted_aligned_img, diag
