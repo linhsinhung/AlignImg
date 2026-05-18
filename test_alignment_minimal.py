@@ -198,6 +198,10 @@ class ResultRow:
     fm_lag: int = 0
     top5_fm_angles: str = ""
     top5_fm_scores: str = ""
+    fm_axis0_best_angle: float = float("nan")
+    fm_axis0_top5_angles: str = ""
+    fm_axis1_best_angle: float = float("nan")
+    fm_axis1_top5_angles: str = ""
 
 
 def normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
@@ -418,6 +422,91 @@ def fourier_mellin_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int
         "top5_fm_scores": ";".join(f"{score:.6g}" for score in top_scores),
     }
 
+
+def _fm_profile_correlation(prof_img: np.ndarray, prof_ref: np.ndarray, geo) -> np.ndarray:
+    """Compute the same padded 1D FFT correlation used by the FM estimator."""
+    prof_img = np.asarray(prof_img, dtype=np.float32).ravel()
+    prof_ref = np.asarray(prof_ref, dtype=np.float32).ravel()
+    if prof_img.size != prof_ref.size:
+        raise ValueError(f"Profile lengths differ: {prof_img.size} != {prof_ref.size}")
+
+    # Match the production estimator for the square minimal benchmark while
+    # allowing the axis diagnostic to stay meaningful if W != H in the future.
+    pad_len = int(prof_img.size)
+    fft_len = int(2 ** np.ceil(np.log2(2 * prof_img.size - 1)))
+    if prof_img.size == int(geo.H):
+        pad_len = int(geo.prof_pad_len)
+        fft_len = int(geo.prof_fft_len)
+
+    prof_img_pad = np.pad(prof_img, (0, pad_len))
+    prof_ref_pad = np.pad(prof_ref, (0, pad_len))
+    fp_img = np.fft.fft(prof_img_pad, n=fft_len)
+    fp_ref = np.fft.fft(prof_ref_pad, n=fft_len)
+    return np.real(np.fft.ifft(fp_img * np.conj(fp_ref))).astype(np.float32, copy=False)
+
+
+def _fm_profile_peak_diagnostics(profile: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Return best lag/angle and top-K valid peaks for a 1D FM score profile."""
+    profile = np.asarray(profile, dtype=np.float32).ravel()
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=profile.size)
+    valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < profile.size)]
+    valid_idx = valid_idx[np.isfinite(profile[valid_idx])]
+    if valid_idx.size == 0:
+        return {
+            "best_angle": float("nan"),
+            "best_lag": 0,
+            "top5_angles": "",
+            "top5_scores": "",
+        }
+
+    ordered = valid_idx[np.argsort(profile[valid_idx])[::-1]]
+    peak_index = int(ordered[0])
+    fft_len = int(profile.size)
+    best_lag = int(peak_index - fft_len if peak_index > fft_len // 2 else peak_index)
+    top = ordered[:top_k]
+    top_angles = [normalize_angle(_angle_from_fm_profile_index(int(idx), geo)) for idx in top]
+    top_scores = [float(profile[int(idx)]) for idx in top]
+    return {
+        "best_angle": normalize_angle(_angle_from_fm_profile_index(peak_index, geo)),
+        "best_lag": best_lag,
+        "top5_angles": ";".join(f"{angle:.3f}" for angle in top_angles),
+        "top5_scores": ";".join(f"{score:.6g}" for score in top_scores),
+    }
+
+
+def fourier_mellin_axis_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Compare both polar summation axes for Fourier-Mellin angle profiles."""
+    h, w = img.shape
+    if h != geo.H or w != geo.W:
+        raise ValueError(f"Image shape {img.shape} does not match geo ({geo.H}, {geo.W})")
+
+    window = geo.window
+    F_img = np.abs(np.fft.fftshift(np.fft.fft2(img * window)))
+    F_ref = np.abs(np.fft.fftshift(np.fft.fft2(ref * window)))
+    F_img = np.log(F_img + 1)
+    F_ref = np.log(F_ref + 1)
+
+    center = (geo.cx, geo.cy)
+    max_radius = geo.max_radius
+    polar_img = cv2.linearPolar(F_img, center, max_radius, cv2.WARP_FILL_OUTLIERS)
+    polar_ref = cv2.linearPolar(F_ref, center, max_radius, cv2.WARP_FILL_OUTLIERS)
+
+    axis0_profile = _fm_profile_correlation(
+        np.sum(polar_img, axis=0),
+        np.sum(polar_ref, axis=0),
+        geo,
+    )
+    axis1_profile = _fm_profile_correlation(
+        np.sum(polar_img, axis=1),
+        np.sum(polar_ref, axis=1),
+        geo,
+    )
+
+    return {
+        "axis0": _fm_profile_peak_diagnostics(axis0_profile, geo, top_k=top_k),
+        "axis1": _fm_profile_peak_diagnostics(axis1_profile, geo, top_k=top_k),
+    }
+
 def append_result(rows: list[ResultRow], row: ResultRow, output_dir: Path, gt: np.ndarray, transformed: np.ndarray, corrected: np.ndarray) -> None:
     rows.append(row)
     if not row.passed:
@@ -507,12 +596,26 @@ def run_rotation_only_fm(gt: np.ndarray, geo, rows: list[ResultRow], output_dir:
     for angle in [0, 12, -34, 77, -123, 179]:
         transformed = rotate_image(gt, geo, angle)
         fm_diag = fourier_mellin_diagnostics(transformed, gt, geo, top_k=5)
+        axis_diag = fourier_mellin_axis_diagnostics(transformed, gt, geo, top_k=5)
         fm_angle = float(fm_diag["fm_angle"])
+        axis0 = axis_diag["axis0"]
+        axis1 = axis_diag["axis1"]
         brute_angle, _ = brute_force_rotation(transformed, gt, geo, step=step)
         ideal_angle = normalize_angle(-angle)
         corrected = transform_final_image(transformed, geo, fm_angle, 0.0, 0.0)
         fm_to_brute = angle_error(fm_angle, brute_angle)
         fm_to_ideal = angle_error(fm_angle, ideal_angle)
+        print(
+            "rotation_only_fourier_mellin_axis_diagnostic: "
+            f"applied_angle={angle:g}, "
+            f"ideal_angle={ideal_angle:.3f}, "
+            f"brute_force_angle={brute_angle:.3f}, "
+            f"current_fm_angle={fm_angle:.3f}, "
+            f"axis0_best_angle={float(axis0['best_angle']):.3f}, "
+            f"axis0_top5_angles={axis0['top5_angles']}, "
+            f"axis1_best_angle={float(axis1['best_angle']):.3f}, "
+            f"axis1_top5_angles={axis1['top5_angles']}"
+        )
         row = evaluate(
             "rotation_only_fourier_mellin_test", gt, corrected, angle, 0, 0,
             ideal_angle, 0, 0, fm_angle, 0, 0,
@@ -530,6 +633,10 @@ def run_rotation_only_fm(gt: np.ndarray, geo, rows: list[ResultRow], output_dir:
             fm_lag=int(fm_diag["fm_lag"]),
             top5_fm_angles=str(fm_diag["top5_fm_angles"]),
             top5_fm_scores=str(fm_diag["top5_fm_scores"]),
+            fm_axis0_best_angle=float(axis0["best_angle"]),
+            fm_axis0_top5_angles=str(axis0["top5_angles"]),
+            fm_axis1_best_angle=float(axis1["best_angle"]),
+            fm_axis1_top5_angles=str(axis1["top5_angles"]),
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
