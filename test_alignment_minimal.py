@@ -198,6 +198,18 @@ class ResultRow:
     fm_lag: int = 0
     top5_fm_angles: str = ""
     top5_fm_scores: str = ""
+    fm_axis0_best_angle: float = float("nan")
+    fm_axis0_top5_angles: str = ""
+    fm_axis1_best_angle: float = float("nan")
+    fm_axis1_top5_angles: str = ""
+    fm_zm_best_angle: float = float("nan")
+    fm_zm_top5_angles: str = ""
+    fm_highpass_best_angle: float = float("nan")
+    fm_highpass_top5_angles: str = ""
+    fm_radial_weight_best_angle: float = float("nan")
+    fm_radial_weight_top5_angles: str = ""
+    fm_polar2d_best_angle: float = float("nan")
+    fm_polar2d_top5_angles: str = ""
 
 
 def normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
@@ -418,6 +430,165 @@ def fourier_mellin_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int
         "top5_fm_scores": ";".join(f"{score:.6g}" for score in top_scores),
     }
 
+
+def _fm_profile_correlation(prof_img: np.ndarray, prof_ref: np.ndarray, geo) -> np.ndarray:
+    """Compute the same padded 1D FFT correlation used by the FM estimator."""
+    prof_img = np.asarray(prof_img, dtype=np.float32).ravel()
+    prof_ref = np.asarray(prof_ref, dtype=np.float32).ravel()
+    if prof_img.size != prof_ref.size:
+        raise ValueError(f"Profile lengths differ: {prof_img.size} != {prof_ref.size}")
+
+    # Match the production estimator for the square minimal benchmark while
+    # allowing the axis diagnostic to stay meaningful if W != H in the future.
+    pad_len = int(prof_img.size)
+    fft_len = int(2 ** np.ceil(np.log2(2 * prof_img.size - 1)))
+    if prof_img.size == int(geo.H):
+        pad_len = int(geo.prof_pad_len)
+        fft_len = int(geo.prof_fft_len)
+
+    prof_img_pad = np.pad(prof_img, (0, pad_len))
+    prof_ref_pad = np.pad(prof_ref, (0, pad_len))
+    fp_img = np.fft.fft(prof_img_pad, n=fft_len)
+    fp_ref = np.fft.fft(prof_ref_pad, n=fft_len)
+    return np.real(np.fft.ifft(fp_img * np.conj(fp_ref))).astype(np.float32, copy=False)
+
+
+def _fm_profile_peak_diagnostics(profile: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Return best lag/angle and top-K valid peaks for a 1D FM score profile."""
+    profile = np.asarray(profile, dtype=np.float32).ravel()
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=profile.size)
+    valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < profile.size)]
+    valid_idx = valid_idx[np.isfinite(profile[valid_idx])]
+    if valid_idx.size == 0:
+        return {
+            "best_angle": float("nan"),
+            "best_lag": 0,
+            "top5_angles": "",
+            "top5_scores": "",
+        }
+
+    ordered = valid_idx[np.argsort(profile[valid_idx])[::-1]]
+    peak_index = int(ordered[0])
+    fft_len = int(profile.size)
+    best_lag = int(peak_index - fft_len if peak_index > fft_len // 2 else peak_index)
+    top = ordered[:top_k]
+    top_angles = [normalize_angle(_angle_from_fm_profile_index(int(idx), geo)) for idx in top]
+    top_scores = [float(profile[int(idx)]) for idx in top]
+    return {
+        "best_angle": normalize_angle(_angle_from_fm_profile_index(peak_index, geo)),
+        "best_lag": best_lag,
+        "top5_angles": ";".join(f"{angle:.3f}" for angle in top_angles),
+        "top5_scores": ";".join(f"{score:.6g}" for score in top_scores),
+    }
+
+
+def _standardize_profile(profile: np.ndarray) -> np.ndarray:
+    """Return a zero-mean/unit-std profile for diagnostic-only FM variants."""
+    profile = np.asarray(profile, dtype=np.float32).ravel()
+    centered = profile - float(np.mean(profile))
+    std = float(np.std(centered))
+    if std > 1e-12:
+        centered = centered / std
+    return centered.astype(np.float32, copy=False)
+
+
+def _fourier_mellin_polar_images(img: np.ndarray, ref: np.ndarray, geo) -> tuple[np.ndarray, np.ndarray]:
+    """Reproduce current Fourier-Mellin preprocessing through linearPolar."""
+    h, w = img.shape
+    if h != geo.H or w != geo.W:
+        raise ValueError(f"Image shape {img.shape} does not match geo ({geo.H}, {geo.W})")
+
+    window = geo.window
+    F_img = np.abs(np.fft.fftshift(np.fft.fft2(img * window)))
+    F_ref = np.abs(np.fft.fftshift(np.fft.fft2(ref * window)))
+    F_img = np.log(F_img + 1)
+    F_ref = np.log(F_ref + 1)
+
+    center = (geo.cx, geo.cy)
+    max_radius = geo.max_radius
+    polar_img = cv2.linearPolar(F_img, center, max_radius, cv2.WARP_FILL_OUTLIERS)
+    polar_ref = cv2.linearPolar(F_ref, center, max_radius, cv2.WARP_FILL_OUTLIERS)
+    return polar_img, polar_ref
+
+
+def _lag_from_fm_profile_index(index: int, profile_size: int) -> int:
+    """Convert an FFT-correlation index to a signed linear-correlation lag."""
+    return int(index) - int(profile_size) if int(index) > int(profile_size) // 2 else int(index)
+
+
+def _polar2d_ncc_profile(polar_img: np.ndarray, polar_ref: np.ndarray, geo) -> np.ndarray:
+    """Score each valid angular lag by 2D polar normalized correlation."""
+    fft_len = int(geo.prof_fft_len)
+    profile = np.full(fft_len, -np.inf, dtype=np.float32)
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=fft_len)
+    valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < fft_len)]
+    for idx in valid_idx:
+        lag = _lag_from_fm_profile_index(int(idx), fft_len)
+        shifted = np.roll(polar_img, -lag, axis=0)
+        profile[int(idx)] = normalized_correlation(shifted, polar_ref)
+    return profile
+
+
+def fourier_mellin_variant_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Run diagnostic-only Fourier-Mellin variants without touching production code."""
+    polar_img, polar_ref = _fourier_mellin_polar_images(img, ref, geo)
+
+    prof_img = np.sum(polar_img, axis=1)
+    prof_ref = np.sum(polar_ref, axis=1)
+    zero_mean_profile = _fm_profile_correlation(
+        _standardize_profile(prof_img),
+        _standardize_profile(prof_ref),
+        geo,
+    )
+
+    polar_img_highpass = polar_img.copy()
+    polar_ref_highpass = polar_ref.copy()
+    r_min = int(0.15 * polar_img_highpass.shape[1])
+    polar_img_highpass[:, :r_min] = 0
+    polar_ref_highpass[:, :r_min] = 0
+    highpass_profile = _fm_profile_correlation(
+        np.sum(polar_img_highpass, axis=1),
+        np.sum(polar_ref_highpass, axis=1),
+        geo,
+    )
+
+    weights = np.linspace(0.0, 1.0, polar_img.shape[1], dtype=np.float32)
+    radial_weight_profile = _fm_profile_correlation(
+        np.sum(polar_img * weights[None, :], axis=1),
+        np.sum(polar_ref * weights[None, :], axis=1),
+        geo,
+    )
+
+    polar2d_profile = _polar2d_ncc_profile(polar_img, polar_ref, geo)
+
+    return {
+        "zero_mean": _fm_profile_peak_diagnostics(zero_mean_profile, geo, top_k=top_k),
+        "highpass": _fm_profile_peak_diagnostics(highpass_profile, geo, top_k=top_k),
+        "radial_weight": _fm_profile_peak_diagnostics(radial_weight_profile, geo, top_k=top_k),
+        "polar2d": _fm_profile_peak_diagnostics(polar2d_profile, geo, top_k=top_k),
+    }
+
+
+def fourier_mellin_axis_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Compare both polar summation axes for Fourier-Mellin angle profiles."""
+    polar_img, polar_ref = _fourier_mellin_polar_images(img, ref, geo)
+
+    axis0_profile = _fm_profile_correlation(
+        np.sum(polar_img, axis=0),
+        np.sum(polar_ref, axis=0),
+        geo,
+    )
+    axis1_profile = _fm_profile_correlation(
+        np.sum(polar_img, axis=1),
+        np.sum(polar_ref, axis=1),
+        geo,
+    )
+
+    return {
+        "axis0": _fm_profile_peak_diagnostics(axis0_profile, geo, top_k=top_k),
+        "axis1": _fm_profile_peak_diagnostics(axis1_profile, geo, top_k=top_k),
+    }
+
 def append_result(rows: list[ResultRow], row: ResultRow, output_dir: Path, gt: np.ndarray, transformed: np.ndarray, corrected: np.ndarray) -> None:
     rows.append(row)
     if not row.passed:
@@ -507,12 +678,36 @@ def run_rotation_only_fm(gt: np.ndarray, geo, rows: list[ResultRow], output_dir:
     for angle in [0, 12, -34, 77, -123, 179]:
         transformed = rotate_image(gt, geo, angle)
         fm_diag = fourier_mellin_diagnostics(transformed, gt, geo, top_k=5)
+        axis_diag = fourier_mellin_axis_diagnostics(transformed, gt, geo, top_k=5)
+        variant_diag = fourier_mellin_variant_diagnostics(transformed, gt, geo, top_k=5)
         fm_angle = float(fm_diag["fm_angle"])
+        axis0 = axis_diag["axis0"]
+        axis1 = axis_diag["axis1"]
+        zero_mean = variant_diag["zero_mean"]
+        highpass = variant_diag["highpass"]
+        radial_weight = variant_diag["radial_weight"]
+        polar2d = variant_diag["polar2d"]
         brute_angle, _ = brute_force_rotation(transformed, gt, geo, step=step)
         ideal_angle = normalize_angle(-angle)
         corrected = transform_final_image(transformed, geo, fm_angle, 0.0, 0.0)
         fm_to_brute = angle_error(fm_angle, brute_angle)
         fm_to_ideal = angle_error(fm_angle, ideal_angle)
+        print(
+            "rotation_only_fourier_mellin_variant_diagnostic: "
+            f"applied_angle={angle:g}, "
+            f"ideal_angle={ideal_angle:.3f}, "
+            f"brute_force_angle={brute_angle:.3f}, "
+            f"current_fm_angle={fm_angle:.3f}, "
+            f"current_top5={fm_diag['top5_fm_angles']}, "
+            f"zero_mean_best={float(zero_mean['best_angle']):.3f}, "
+            f"zero_mean_top5={zero_mean['top5_angles']}, "
+            f"highpass_best={float(highpass['best_angle']):.3f}, "
+            f"highpass_top5={highpass['top5_angles']}, "
+            f"radial_weight_best={float(radial_weight['best_angle']):.3f}, "
+            f"radial_weight_top5={radial_weight['top5_angles']}, "
+            f"polar2d_best={float(polar2d['best_angle']):.3f}, "
+            f"polar2d_top5={polar2d['top5_angles']}"
+        )
         row = evaluate(
             "rotation_only_fourier_mellin_test", gt, corrected, angle, 0, 0,
             ideal_angle, 0, 0, fm_angle, 0, 0,
@@ -530,6 +725,18 @@ def run_rotation_only_fm(gt: np.ndarray, geo, rows: list[ResultRow], output_dir:
             fm_lag=int(fm_diag["fm_lag"]),
             top5_fm_angles=str(fm_diag["top5_fm_angles"]),
             top5_fm_scores=str(fm_diag["top5_fm_scores"]),
+            fm_axis0_best_angle=float(axis0["best_angle"]),
+            fm_axis0_top5_angles=str(axis0["top5_angles"]),
+            fm_axis1_best_angle=float(axis1["best_angle"]),
+            fm_axis1_top5_angles=str(axis1["top5_angles"]),
+            fm_zm_best_angle=float(zero_mean["best_angle"]),
+            fm_zm_top5_angles=str(zero_mean["top5_angles"]),
+            fm_highpass_best_angle=float(highpass["best_angle"]),
+            fm_highpass_top5_angles=str(highpass["top5_angles"]),
+            fm_radial_weight_best_angle=float(radial_weight["best_angle"]),
+            fm_radial_weight_top5_angles=str(radial_weight["top5_angles"]),
+            fm_polar2d_best_angle=float(polar2d["best_angle"]),
+            fm_polar2d_top5_angles=str(polar2d["top5_angles"]),
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
