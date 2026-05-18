@@ -356,7 +356,37 @@ def brute_force_rotation(img: np.ndarray, ref: np.ndarray, geo, step: float = 2.
             best_angle = float(cand)
     return normalize_angle(best_angle), float(best_corr)
 
+def brute_force_rotation_translation(img, ref, geo, step=2.0):
+    best = {
+        "angle": 0.0,
+        "dy": 0.0,
+        "dx": 0.0,
+        "corr": -np.inf,
+        "fft_score": -np.inf,
+    }
 
+    for cand in np.arange(-180.0, 180.0, step):
+        # Apply candidate correction angle first
+        rotated = rotate_image(img, geo, float(cand))
+
+        # FFT returns observed displacement, so correction is negative
+        obs_dy, obs_dx, fft_score = get_best_translation_fft(rotated, ref, geo)
+        corr_dy = -obs_dy
+        corr_dx = -obs_dx
+
+        corrected = transform_final_image(img, geo, float(cand), corr_dy, corr_dx)
+        corr = normalized_correlation(corrected, ref)
+
+        if corr > best["corr"]:
+            best = {
+                "angle": normalize_angle(float(cand)),
+                "dy": float(corr_dy),
+                "dx": float(corr_dx),
+                "corr": float(corr),
+                "fft_score": float(fft_score),
+            }
+
+    return best
 
 def fourier_mellin_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int = 5) -> dict:
     """Return Fourier-Mellin peak diagnostics without changing estimator behavior."""
@@ -526,21 +556,32 @@ def run_rotation_translation_oracle(gt: np.ndarray, geo, rows: list[ResultRow], 
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
-        # Estimate angle by image-space brute force, then estimate observed
-        # translation residual and negate it to get the correction shift.
-        best_angle, best_corr = brute_force_rotation(transformed, gt, geo, step=step)
-        rotated = rotate_image(transformed, geo, best_angle)
-        obs_dy, obs_dx, score = get_best_translation_fft(rotated, gt, geo)
-        corr_dy = -obs_dy
-        corr_dx = -obs_dx
+        # Joint brute-force search:
+        # For each candidate angle, estimate translation and score the fully corrected image.
+        best = brute_force_rotation_translation(transformed, gt, geo, step=step)
+        
+        best_angle = best["angle"]
+        corr_dy = best["dy"]
+        corr_dx = best["dx"]
+        score = best["fft_score"]
+        best_corr = best["corr"]
+        
         corrected = transform_final_image(transformed, geo, best_angle, corr_dy, corr_dx)
+        
         row = evaluate(
-            "rotation_translation_bruteforce_angle_test", gt, corrected, angle, dy, dx,
+            "rotation_translation_joint_bruteforce_test", gt, corrected, angle, dy, dx,
             ideal_angle, ideal_dy, ideal_dx, best_angle, corr_dy, corr_dx,
-            angle_error(best_angle, ideal_angle) <= step + 0.25 and abs(corr_dy - ideal_dy) <= 2.0 and abs(corr_dx - ideal_dx) <= 2.0,
-            f"bruteforce_step={step:g}; rotation_corr_before_translation={best_corr:.6f}; fft_score={score:.6g}; observed residual negated",
-            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
-            negated_fft_dy=corr_dy, negated_fft_dx=corr_dx,
+            angle_error(best_angle, ideal_angle) <= step + 0.25
+            and abs(corr_dy - ideal_dy) <= 2.0
+            and abs(corr_dx - ideal_dx) <= 2.0,
+            (
+                f"joint_bruteforce_step={step:g}; "
+                f"best_corrected_corr={best_corr:.6f}; "
+                f"fft_score={score:.6g}; "
+                f"angle+translation selected jointly"
+            ),
+            negated_fft_dy=corr_dy,
+            negated_fft_dx=corr_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
@@ -554,23 +595,34 @@ def run_noise_sweep(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path
         transformed = add_noise(clean_transformed, noise, rng)
 
         # Brute-force angle then FFT observed residual, deliberately simple staged estimator.
-        best_angle, best_corr = brute_force_rotation(transformed, gt, geo, step=step)
-        rotated = rotate_image(transformed, geo, best_angle)
-        obs_dy, obs_dx, score = get_best_translation_fft(rotated, gt, geo)
-        corr_dy = -obs_dy
-        corr_dx = -obs_dx
+        best = brute_force_rotation_translation(transformed, gt, geo, step=step)
+
+        best_angle = best["angle"]
+        corr_dy = best["dy"]
+        corr_dx = best["dx"]
+        score = best["fft_score"]
+        best_corr = best["corr"]
+        
         corrected = transform_final_image(transformed, geo, best_angle, corr_dy, corr_dx)
         corr = normalized_correlation(corrected, gt)
+        
         pass_condition = corr > (0.98 if noise == 0 else 0.80)
         row = evaluate(
-            "noise_sweep_test", gt, corrected, angle, dy, dx,
+            "noise_sweep_joint_bruteforce_test", gt, corrected, angle, dy, dx,
             ideal_angle, ideal_dy, ideal_dx, best_angle, corr_dy, corr_dx,
-            pass_condition,
-            f"noise={noise:g}; angle_by_bruteforce; pre_translation_corr={best_corr:.6f}; fft_score={score:.6g}; observed residual negated",
+            angle_error(best_angle, ideal_angle) <= step + 0.25
+            and abs(corr_dy - ideal_dy) <= 2.5
+            and abs(corr_dx - ideal_dx) <= 2.5,
+            (
+                f"noise={noise:g}; joint angle+translation brute force; "
+                f"best_corrected_corr={best_corr:.6f}; fft_score={score:.6g}"
+            ),
             corr_threshold=(0.98 if noise == 0 else 0.80),
-            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
-            negated_fft_dy=corr_dy, negated_fft_dx=corr_dx,
+            negated_fft_dy=corr_dy,
+            negated_fft_dx=corr_dx,
         )
+        
+        
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
 
