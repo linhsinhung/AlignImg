@@ -93,6 +93,7 @@ _TEMPERATURE = 0.1
 _USE_FM_CANDIDATES = False
 _SOFT = False
 _RETURN_DIAGNOSTICS = False
+_COARSE_ANGLE_MODE = "grid_joint"
 _COM_SIGMA = None
 
 
@@ -114,12 +115,12 @@ def _worker_calc_com(img: np.ndarray):
 def _init_worker_align(geo, ref_match, mask_diameter, lp_sigma,
                        is_global_search, search_range, search_step,
                        K=1, temperature=0.1, use_fm_candidates=False, soft=False,
-                       return_diagnostics=False):
+                       return_diagnostics=False, coarse_angle_mode="grid_joint"):
     """
     Initializer for alignment workers (per-iteration).
     """
     global _GEO, _REF_MATCH, _MASK_DIAMETER, _LP_SIGMA, _IS_GLOBAL, _SEARCH_RANGE, _SEARCH_STEP
-    global _K, _TEMPERATURE, _USE_FM_CANDIDATES, _SOFT, _RETURN_DIAGNOSTICS
+    global _K, _TEMPERATURE, _USE_FM_CANDIDATES, _SOFT, _RETURN_DIAGNOSTICS, _COARSE_ANGLE_MODE
     _GEO = geo
     _REF_MATCH = ref_match
     _MASK_DIAMETER = mask_diameter
@@ -132,6 +133,7 @@ def _init_worker_align(geo, ref_match, mask_diameter, lp_sigma,
     _USE_FM_CANDIDATES = use_fm_candidates
     _SOFT = soft
     _RETURN_DIAGNOSTICS = return_diagnostics
+    _COARSE_ANGLE_MODE = coarse_angle_mode
 
 
 def _align_one_cpu(
@@ -151,6 +153,7 @@ def _align_one_cpu(
     use_fm_candidates: bool = False,
     soft: bool = False,
     return_diagnostics: bool = False,
+    coarse_angle_mode: str = "grid_joint",
 ):
     """
     Shared core logic for aligning one particle (used by serial + parallel).
@@ -173,6 +176,7 @@ def _align_one_cpu(
         use_fm_candidates=use_fm_candidates,
         soft=soft,
         return_diagnostics=return_diagnostics,
+        coarse_angle_mode=coarse_angle_mode,
     )
 
 
@@ -210,6 +214,7 @@ def _worker_align_particle(task):
         use_fm_candidates=_USE_FM_CANDIDATES,
         soft=_SOFT,
         return_diagnostics=bool(want_diag),
+        coarse_angle_mode=_COARSE_ANGLE_MODE,
     )
     if want_diag:
         new_params, aligned_img, diag = result
@@ -256,7 +261,7 @@ def iter_params(it: int, num_iterations: int):
 # =============================================================================
 def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diameter=None, verbose=True,
                                   use_multicandidate=False, topk_initial=5, anneal_multicandidate=True,
-                                  diagnostics_n=0):
+                                  diagnostics_n=0, coarse_angle_mode="grid_joint"):
     """Standard serial processing compatible with align_utils.py"""
     _vprint(verbose, ">> Mode: Serial (CPU Single Core)")
     N, H, W = X.shape
@@ -318,6 +323,7 @@ def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diamete
                 use_fm_candidates=sched["use_fm_candidates"],
                 soft=sched["soft"],
                 return_diagnostics=want_diag,
+                coarse_angle_mode=coarse_angle_mode,
             )
             if want_diag:
                 new_params, aligned_img, diag = align_result
@@ -346,7 +352,7 @@ def run_stateful_alignment_serial(X, initial_ref, num_iterations=4, mask_diamete
 # =============================================================================
 def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diameter=None, n_jobs=-1, verbose=True,
                                     use_multicandidate=False, topk_initial=5, anneal_multicandidate=True,
-                                    diagnostics_n=0):
+                                    diagnostics_n=0, coarse_angle_mode="grid_joint"):
     """Parallelized Alignment Driver (improved pickling efficiency)."""
 
     # Determine workers
@@ -421,7 +427,7 @@ def run_stateful_alignment_parallel(X, initial_ref, num_iterations=4, mask_diame
             processes=num_workers,
             initializer=_init_worker_align,
             initargs=(geo, ref_match, mask_diameter, lp_sigma, is_global_search, search_range, search_step,
-                      sched["K"], sched["temperature"], sched["use_fm_candidates"], sched["soft"], False),
+                      sched["K"], sched["temperature"], sched["use_fm_candidates"], sched["soft"], False, coarse_angle_mode),
         ) as pool:
             iterator = pool.imap(_worker_align_particle, _iter_tasks(), chunksize=5)
             for item in tqdm(iterator, total=N, desc="   Aligning", disable=not verbose):
@@ -681,7 +687,7 @@ def run_batch_alignment_gpu(
 def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None, 
                   use_gpu=False, n_jobs=None, batch_size=4096, profile_gpu=False, verbose=True,
                   use_multicandidate=False, topk_initial=5, anneal_multicandidate=True,
-                  diagnostics_n=0):
+                  diagnostics_n=0, coarse_angle_mode="grid_joint"):
     """
     Unified entry point for 2D Alignment.
     
@@ -701,6 +707,7 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         topk_initial (int): Initial K for the first multi-candidate iteration.
         anneal_multicandidate (bool): Reduce K/temperature over iterations.
         diagnostics_n (int): Store candidate diagnostics for the first N particles.
+        coarse_angle_mode (str): CPU global-angle mode: "grid_joint" (default) or "fm".
 
     Returns:
         final_ref (np.ndarray): Aligned reference.
@@ -719,10 +726,14 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
     engine = None
     final_ref = history = params = com_offsets = None
     candidate_diagnostics = []
+    if coarse_angle_mode not in {"fm", "grid_joint"}:
+        raise ValueError("coarse_angle_mode must be 'fm' or 'grid_joint'")
 
     # 1. GPU Logic with Fallback
     if use_gpu:
-        if HAS_GPU:
+        if coarse_angle_mode == "grid_joint":
+            _vprint(verbose, "\n[WARNING] coarse_angle_mode='grid_joint' is CPU-only; switching to CPU mode.\n")
+        elif HAS_GPU:
             try:
                 # Attempt to run on GPU
                 final_ref, history, params, com_offsets, gpu_profile = run_batch_alignment_gpu(
@@ -753,6 +764,7 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                 topk_initial=topk_initial,
                 anneal_multicandidate=anneal_multicandidate,
                 diagnostics_n=diagnostics_n,
+                coarse_angle_mode=coarse_angle_mode,
             )
             if len(serial_result) == 5:
                 final_ref, history, params, com_offsets, candidate_diagnostics = serial_result
@@ -772,6 +784,7 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
                 topk_initial=topk_initial,
                 anneal_multicandidate=anneal_multicandidate,
                 diagnostics_n=diagnostics_n,
+                coarse_angle_mode=coarse_angle_mode,
             )
             if len(parallel_result) == 5:
                 final_ref, history, params, com_offsets, candidate_diagnostics = parallel_result
@@ -789,6 +802,7 @@ def run_alignment(X, initial_ref, num_iterations=4, mask_diameter=None,
         "topk_initial": topk_initial,
         "anneal_multicandidate": anneal_multicandidate,
         "candidate_diagnostics": candidate_diagnostics,
+        "coarse_angle_mode": coarse_angle_mode,
     }
     if engine == "gpu" and profile_gpu:
         meta["gpu_profile"] = gpu_profile

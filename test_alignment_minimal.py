@@ -155,6 +155,7 @@ cv2 = importlib.import_module("cv2")
 from align_utils import (
     apply_circular_mask,
     apply_lowpass_filter,
+    coarse_to_fine_joint_search,
     _angle_from_fm_profile_index,
     _valid_fm_lag_indices,
     get_best_translation_fft,
@@ -791,6 +792,35 @@ def run_rotation_translation_oracle(gt: np.ndarray, geo, rows: list[ResultRow], 
             negated_fft_dx=corr_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
+
+        # Coarse-to-fine joint search should recover the same cases with fewer
+        # angle evaluations than a full 2-degree brute-force scan.
+        ctf_best = coarse_to_fine_joint_search(transformed, gt, geo)
+        ctf_angle = ctf_best["angle"]
+        ctf_dy = ctf_best["dy"]
+        ctf_dx = ctf_best["dx"]
+        ctf_score = ctf_best["fft_score"]
+        ctf_corr = ctf_best["score"]
+        ctf_evals = int(ctf_best.get("n_evaluations", 0))
+
+        ctf_corrected = transform_final_image(transformed, geo, ctf_angle, ctf_dy, ctf_dx)
+
+        row = evaluate(
+            "rotation_translation_coarse_to_fine_joint_test", gt, ctf_corrected, angle, dy, dx,
+            ideal_angle, ideal_dy, ideal_dx, ctf_angle, ctf_dy, ctf_dx,
+            angle_error(ctf_angle, ideal_angle) <= 0.75
+            and abs(ctf_dy - ideal_dy) <= 2.0
+            and abs(ctf_dx - ideal_dx) <= 2.0
+            and ctf_evals < len(np.arange(-180.0, 180.0, step)),
+            (
+                f"coarse_to_fine_joint; evals={ctf_evals}; "
+                f"full_2deg_evals={len(np.arange(-180.0, 180.0, step))}; "
+                f"best_corrected_corr={ctf_corr:.6f}; fft_score={ctf_score:.6g}"
+            ),
+            negated_fft_dy=ctf_dy,
+            negated_fft_dx=ctf_dx,
+        )
+        append_result(rows, row, output_dir, gt, transformed, ctf_corrected)
 
 
 def run_noise_sweep(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path, step: float = 2.0) -> None:
