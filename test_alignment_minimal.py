@@ -155,8 +155,10 @@ cv2 = importlib.import_module("cv2")
 from align_utils import (
     apply_circular_mask,
     apply_lowpass_filter,
+    _angle_from_fm_profile_index,
+    _valid_fm_lag_indices,
     get_best_translation_fft,
-    get_coarse_angle_fourier_mellin,
+    get_coarse_angle_fourier_mellin_profile,
     get_geometry_context,
     normalize_angle,
     rotate_image,
@@ -184,6 +186,18 @@ class ResultRow:
     nrmse: float
     passed: bool
     notes: str
+    raw_fft_dy: float = float("nan")
+    raw_fft_dx: float = float("nan")
+    negated_fft_dy: float = float("nan")
+    negated_fft_dx: float = float("nan")
+    fm_angle: float = float("nan")
+    bruteforce_angle: float = float("nan")
+    fm_vs_bruteforce_error: float = float("nan")
+    fm_vs_ideal_error: float = float("nan")
+    fm_peak_index: int = -1
+    fm_lag: int = 0
+    top5_fm_angles: str = ""
+    top5_fm_scores: str = ""
 
 
 def normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
@@ -292,7 +306,7 @@ def ideal_correction_for_rotate_then_shift(applied_angle: float, applied_dy: flo
 
 def evaluate(test_name: str, gt: np.ndarray, corrected: np.ndarray, applied_angle: float, applied_dy: float, applied_dx: float,
              ideal_angle: float, ideal_dy: float, ideal_dx: float, estimated_angle: float, estimated_dy: float, estimated_dx: float,
-             pass_condition: bool, notes: str, corr_threshold: float = 0.98) -> ResultRow:
+             pass_condition: bool, notes: str, corr_threshold: float = 0.98, **diagnostics) -> ResultRow:
     corr = normalized_correlation(corrected, gt)
     err = nrmse(corrected, gt)
     return ResultRow(
@@ -313,6 +327,7 @@ def evaluate(test_name: str, gt: np.ndarray, corrected: np.ndarray, applied_angl
         nrmse=float(err),
         passed=bool(pass_condition and corr > corr_threshold),
         notes=notes,
+        **diagnostics,
     )
 
 
@@ -342,6 +357,37 @@ def brute_force_rotation(img: np.ndarray, ref: np.ndarray, geo, step: float = 2.
     return normalize_angle(best_angle), float(best_corr)
 
 
+
+def fourier_mellin_diagnostics(img: np.ndarray, ref: np.ndarray, geo, top_k: int = 5) -> dict:
+    """Return Fourier-Mellin peak diagnostics without changing estimator behavior."""
+    fm_angle, profile = get_coarse_angle_fourier_mellin_profile(img, ref, geo)
+    valid_idx = _valid_fm_lag_indices(geo, profile_size=profile.size)
+    valid_idx = valid_idx[(valid_idx >= 0) & (valid_idx < profile.size)]
+    valid_idx = valid_idx[np.isfinite(profile[valid_idx])]
+    if valid_idx.size == 0:
+        return {
+            "fm_angle": normalize_angle(float(fm_angle)),
+            "fm_peak_index": -1,
+            "fm_lag": 0,
+            "top5_fm_angles": "",
+            "top5_fm_scores": "",
+        }
+
+    ordered = valid_idx[np.argsort(profile[valid_idx])[::-1]]
+    peak_index = int(ordered[0])
+    fft_len = int(profile.size)
+    fm_lag = int(peak_index - fft_len if peak_index > fft_len // 2 else peak_index)
+    top = ordered[:top_k]
+    top_angles = [normalize_angle(_angle_from_fm_profile_index(int(idx), geo)) for idx in top]
+    top_scores = [float(profile[int(idx)]) for idx in top]
+    return {
+        "fm_angle": normalize_angle(float(fm_angle)),
+        "fm_peak_index": peak_index,
+        "fm_lag": fm_lag,
+        "top5_fm_angles": ";".join(f"{angle:.3f}" for angle in top_angles),
+        "top5_fm_scores": ";".join(f"{score:.6g}" for score in top_scores),
+    }
+
 def append_result(rows: list[ResultRow], row: ResultRow, output_dir: Path, gt: np.ndarray, transformed: np.ndarray, corrected: np.ndarray) -> None:
     rows.append(row)
     if not row.passed:
@@ -367,17 +413,47 @@ def run_transform_inverse(gt: np.ndarray, geo, rows: list[ResultRow], output_dir
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
 
+def run_translation_sign_diagnostic(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path) -> None:
+    for dy, dx in [(5, -7), (-9, 4), (11, 12)]:
+        transformed = shift_image(gt, geo, dy, dx)
+        raw_fft_dy, raw_fft_dx, score = get_best_translation_fft(transformed, gt, geo)
+        negated_fft_dy = -raw_fft_dy
+        negated_fft_dx = -raw_fft_dx
+        ideal_angle, ideal_dy, ideal_dx = 0.0, -dy, -dx
+        corrected = transform_final_image(transformed, geo, 0.0, negated_fft_dy, negated_fft_dx)
+        print(
+            "translation_sign_diagnostic_test: "
+            f"applied=({dy:g}, {dx:g}), "
+            f"ideal_correction=({ideal_dy:g}, {ideal_dx:g}), "
+            f"raw_fft=({raw_fft_dy:g}, {raw_fft_dx:g}), "
+            f"negated_fft=({negated_fft_dy:g}, {negated_fft_dx:g})"
+        )
+        row = evaluate(
+            "translation_sign_diagnostic_test", gt, corrected, 0, dy, dx,
+            ideal_angle, ideal_dy, ideal_dx, 0.0, negated_fft_dy, negated_fft_dx,
+            abs(negated_fft_dy - ideal_dy) <= 1 and abs(negated_fft_dx - ideal_dx) <= 1,
+            f"fft_score={score:.6g}; raw FFT displacement is stored separately",
+            raw_fft_dy=raw_fft_dy, raw_fft_dx=raw_fft_dx,
+            negated_fft_dy=negated_fft_dy, negated_fft_dx=negated_fft_dx,
+        )
+        append_result(rows, row, output_dir, gt, transformed, corrected)
+
+
 def run_translation_only(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path) -> None:
     for dy, dx in [(0, 0), (5, -7), (-9, 4), (11, 12)]:
         transformed = shift_image(gt, geo, dy, dx)
-        est_dy, est_dx, score = get_best_translation_fft(transformed, gt, geo)
+        obs_dy, obs_dx, score = get_best_translation_fft(transformed, gt, geo)
+        correction_dy = -obs_dy
+        correction_dx = -obs_dx
         ideal_angle, ideal_dy, ideal_dx = 0.0, -dy, -dx
-        corrected = transform_final_image(transformed, geo, 0.0, est_dy, est_dx)
+        corrected = transform_final_image(transformed, geo, 0.0, correction_dy, correction_dx)
         row = evaluate(
             "translation_only_oracle_test", gt, corrected, 0, dy, dx,
-            ideal_angle, ideal_dy, ideal_dx, 0.0, est_dy, est_dx,
-            abs(est_dy - ideal_dy) <= 1 and abs(est_dx - ideal_dx) <= 1,
-            f"fft_score={score:.6g}; estimated correction shift vs ideal",
+            ideal_angle, ideal_dy, ideal_dx, 0.0, correction_dy, correction_dx,
+            abs(correction_dy - ideal_dy) <= 1 and abs(correction_dx - ideal_dx) <= 1,
+            f"fft_score={score:.6g}; raw FFT displacement negated for correction",
+            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
+            negated_fft_dy=correction_dy, negated_fft_dx=correction_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
@@ -400,16 +476,30 @@ def run_rotation_only_bruteforce(gt: np.ndarray, geo, rows: list[ResultRow], out
 def run_rotation_only_fm(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path, step: float = 2.0) -> None:
     for angle in [0, 12, -34, 77, -123, 179]:
         transformed = rotate_image(gt, geo, angle)
-        fm_angle = normalize_angle(get_coarse_angle_fourier_mellin(transformed, gt, geo))
+        fm_diag = fourier_mellin_diagnostics(transformed, gt, geo, top_k=5)
+        fm_angle = float(fm_diag["fm_angle"])
         brute_angle, _ = brute_force_rotation(transformed, gt, geo, step=step)
         ideal_angle = normalize_angle(-angle)
         corrected = transform_final_image(transformed, geo, fm_angle, 0.0, 0.0)
         fm_to_brute = angle_error(fm_angle, brute_angle)
+        fm_to_ideal = angle_error(fm_angle, ideal_angle)
         row = evaluate(
             "rotation_only_fourier_mellin_test", gt, corrected, angle, 0, 0,
             ideal_angle, 0, 0, fm_angle, 0, 0,
-            angle_error(fm_angle, ideal_angle) <= max(step, 360.0 / geo.H) + 1.0,
-            f"bruteforce_angle={brute_angle:.3f}; fm_vs_bruteforce_error={fm_to_brute:.3f}",
+            fm_to_ideal <= max(step, 360.0 / geo.H) + 1.0,
+            (
+                f"bruteforce_angle={brute_angle:.3f}; "
+                f"fm_vs_bruteforce_error={fm_to_brute:.3f}; "
+                f"fm_vs_ideal_error={fm_to_ideal:.3f}"
+            ),
+            fm_angle=fm_angle,
+            bruteforce_angle=brute_angle,
+            fm_vs_bruteforce_error=fm_to_brute,
+            fm_vs_ideal_error=fm_to_ideal,
+            fm_peak_index=int(fm_diag["fm_peak_index"]),
+            fm_lag=int(fm_diag["fm_lag"]),
+            top5_fm_angles=str(fm_diag["top5_fm_angles"]),
+            top5_fm_scores=str(fm_diag["top5_fm_scores"]),
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
@@ -419,28 +509,38 @@ def run_rotation_translation_oracle(gt: np.ndarray, geo, rows: list[ResultRow], 
         transformed = shift_image(rotate_image(gt, geo, angle), geo, dy, dx)
         ideal_angle, ideal_dy, ideal_dx = ideal_correction_for_rotate_then_shift(angle, dy, dx)
 
-        # Known ideal correction angle, estimate translation after rotation.
+        # Known ideal correction angle, estimate observed residual after rotation,
+        # then negate it to get the correction shift.
         rotated = rotate_image(transformed, geo, ideal_angle)
-        est_dy, est_dx, score = get_best_translation_fft(rotated, gt, geo)
-        corrected = transform_final_image(transformed, geo, ideal_angle, est_dy, est_dx)
+        obs_dy, obs_dx, score = get_best_translation_fft(rotated, gt, geo)
+        corr_dy = -obs_dy
+        corr_dx = -obs_dx
+        corrected = transform_final_image(transformed, geo, ideal_angle, corr_dy, corr_dx)
         row = evaluate(
             "rotation_translation_oracle_angle_test", gt, corrected, angle, dy, dx,
-            ideal_angle, ideal_dy, ideal_dx, ideal_angle, est_dy, est_dx,
-            abs(est_dy - ideal_dy) <= 1.5 and abs(est_dx - ideal_dx) <= 1.5,
-            f"known angle; fft_score={score:.6g}",
+            ideal_angle, ideal_dy, ideal_dx, ideal_angle, corr_dy, corr_dx,
+            abs(corr_dy - ideal_dy) <= 1.5 and abs(corr_dx - ideal_dx) <= 1.5,
+            f"known angle; fft_score={score:.6g}; observed residual negated for correction",
+            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
+            negated_fft_dy=corr_dy, negated_fft_dx=corr_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
-        # Estimate angle by image-space brute force, then estimate translation.
+        # Estimate angle by image-space brute force, then estimate observed
+        # translation residual and negate it to get the correction shift.
         best_angle, best_corr = brute_force_rotation(transformed, gt, geo, step=step)
         rotated = rotate_image(transformed, geo, best_angle)
-        est_dy, est_dx, score = get_best_translation_fft(rotated, gt, geo)
-        corrected = transform_final_image(transformed, geo, best_angle, est_dy, est_dx)
+        obs_dy, obs_dx, score = get_best_translation_fft(rotated, gt, geo)
+        corr_dy = -obs_dy
+        corr_dx = -obs_dx
+        corrected = transform_final_image(transformed, geo, best_angle, corr_dy, corr_dx)
         row = evaluate(
             "rotation_translation_bruteforce_angle_test", gt, corrected, angle, dy, dx,
-            ideal_angle, ideal_dy, ideal_dx, best_angle, est_dy, est_dx,
-            angle_error(best_angle, ideal_angle) <= step + 0.25 and abs(est_dy - ideal_dy) <= 2.0 and abs(est_dx - ideal_dx) <= 2.0,
-            f"bruteforce_step={step:g}; rotation_corr_before_translation={best_corr:.6f}; fft_score={score:.6g}",
+            ideal_angle, ideal_dy, ideal_dx, best_angle, corr_dy, corr_dx,
+            angle_error(best_angle, ideal_angle) <= step + 0.25 and abs(corr_dy - ideal_dy) <= 2.0 and abs(corr_dx - ideal_dx) <= 2.0,
+            f"bruteforce_step={step:g}; rotation_corr_before_translation={best_corr:.6f}; fft_score={score:.6g}; observed residual negated",
+            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
+            negated_fft_dy=corr_dy, negated_fft_dx=corr_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
@@ -453,19 +553,23 @@ def run_noise_sweep(gt: np.ndarray, geo, rows: list[ResultRow], output_dir: Path
     for noise in [0, 0.05, 0.1, 0.2, 0.35]:
         transformed = add_noise(clean_transformed, noise, rng)
 
-        # Brute-force angle then FFT shift, deliberately simple staged estimator.
+        # Brute-force angle then FFT observed residual, deliberately simple staged estimator.
         best_angle, best_corr = brute_force_rotation(transformed, gt, geo, step=step)
         rotated = rotate_image(transformed, geo, best_angle)
-        est_dy, est_dx, score = get_best_translation_fft(rotated, gt, geo)
-        corrected = transform_final_image(transformed, geo, best_angle, est_dy, est_dx)
+        obs_dy, obs_dx, score = get_best_translation_fft(rotated, gt, geo)
+        corr_dy = -obs_dy
+        corr_dx = -obs_dx
+        corrected = transform_final_image(transformed, geo, best_angle, corr_dy, corr_dx)
         corr = normalized_correlation(corrected, gt)
         pass_condition = corr > (0.98 if noise == 0 else 0.80)
         row = evaluate(
             "noise_sweep_test", gt, corrected, angle, dy, dx,
-            ideal_angle, ideal_dy, ideal_dx, best_angle, est_dy, est_dx,
+            ideal_angle, ideal_dy, ideal_dx, best_angle, corr_dy, corr_dx,
             pass_condition,
-            f"noise={noise:g}; angle_by_bruteforce; pre_translation_corr={best_corr:.6f}; fft_score={score:.6g}",
+            f"noise={noise:g}; angle_by_bruteforce; pre_translation_corr={best_corr:.6f}; fft_score={score:.6g}; observed residual negated",
             corr_threshold=(0.98 if noise == 0 else 0.80),
+            raw_fft_dy=obs_dy, raw_fft_dx=obs_dx,
+            negated_fft_dy=corr_dy, negated_fft_dx=corr_dx,
         )
         append_result(rows, row, output_dir, gt, transformed, corrected)
 
@@ -515,6 +619,7 @@ def main() -> int:
 
     rows: list[ResultRow] = []
     run_transform_inverse(gt, geo, rows, args.output_dir)
+    run_translation_sign_diagnostic(gt, geo, rows, args.output_dir)
     run_translation_only(gt, geo, rows, args.output_dir)
     run_rotation_only_bruteforce(gt, geo, rows, args.output_dir, step=args.angle_step)
     run_rotation_only_fm(gt, geo, rows, args.output_dir, step=args.angle_step)
