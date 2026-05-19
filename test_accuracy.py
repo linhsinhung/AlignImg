@@ -46,6 +46,8 @@ class MethodResult:
     corrected_stack: np.ndarray
     particle_metrics: dict[str, np.ndarray]
     summary: dict[str, float | str]
+    final_ref_global_corrected: np.ndarray | None = None
+    gauge_corrected_stack: np.ndarray | None = None
 
 
 def angle_diff_deg(a: np.ndarray | float, b: np.ndarray | float) -> np.ndarray:
@@ -157,6 +159,27 @@ def normalized_corr(img: np.ndarray, ref: np.ndarray, mask: np.ndarray | None = 
     return float(np.sum(a * b) / (np.sqrt(np.sum(a * a) * np.sum(b * b)) + 1e-8))
 
 
+
+
+def estimate_global_reference_transform(final_ref: np.ndarray, gt_img: np.ndarray, geo: au.GeometryContext) -> tuple[float, float, float, float]:
+    """Estimate global gauge transform that maps final_ref into gt_img frame."""
+    best = au.coarse_to_fine_joint_search(final_ref, gt_img, geo)
+    return float(best["angle"]), float(best["dy"]), float(best["dx"]), float(best["score"])
+
+
+def apply_global_gauge_to_corrected_stack(
+    corrected_stack: np.ndarray,
+    geo: au.GeometryContext,
+    global_angle: float,
+    global_dy: float,
+    global_dx: float,
+) -> np.ndarray:
+    """Apply a common global gauge transform to all corrected particles."""
+    out = np.empty_like(corrected_stack, dtype=np.float32)
+    for i, img in enumerate(corrected_stack):
+        out[i] = au.transform_final_image(img, geo, global_angle, global_dy, global_dx)
+    return out
+
 def evaluate_method(
     name: str,
     final_ref: np.ndarray,
@@ -167,6 +190,7 @@ def evaluate_method(
     mask: np.ndarray,
     elapsed_s: float,
     engine: str,
+    geo: au.GeometryContext,
 ) -> MethodResult:
     ideal_angle = gt_table[:, 3]
     ideal_dy = gt_table[:, 4]
@@ -181,6 +205,18 @@ def evaluate_method(
     particle_corr = np.array([normalized_corr(img, gt_img, mask) for img in corrected], dtype=np.float32)
     mean_corrected = np.mean(corrected, axis=0)
 
+    global_angle, global_dy, global_dx, global_score = estimate_global_reference_transform(final_ref, gt_img, geo)
+    final_ref_global_corrected = au.transform_final_image(final_ref, geo, global_angle, global_dy, global_dx)
+    gauge_corrected_stack = apply_global_gauge_to_corrected_stack(corrected, geo, global_angle, global_dy, global_dx)
+    gauge_corrected_mean = np.mean(gauge_corrected_stack, axis=0)
+
+    raw_angle_error = angle_diff_deg(params[:, 0], ideal_angle).astype(np.float32)
+    global_angle_offset = float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.deg2rad(raw_angle_error))))))
+    angle_error_gauge_corrected = angle_diff_deg(params[:, 0] - global_angle_offset, ideal_angle).astype(np.float32)
+
+    gauge_particle_nrmse = np.array([normalized_rmse(img, gt_img, mask) for img in gauge_corrected_stack], dtype=np.float32)
+    gauge_particle_corr = np.array([normalized_corr(img, gt_img, mask) for img in gauge_corrected_stack], dtype=np.float32)
+
     metrics = {
         "angle_error_deg": angle_err,
         "dy_error_px": dy_err,
@@ -189,6 +225,8 @@ def evaluate_method(
         "particle_nrmse": particle_nrmse,
         "particle_corr": particle_corr,
         "score": params[:, 3].astype(np.float32),
+        "raw_angle_error_deg": raw_angle_error,
+        "angle_error_gauge_corrected_deg": angle_error_gauge_corrected,
     }
     summary: dict[str, float | str] = {
         "method": name,
@@ -205,8 +243,29 @@ def evaluate_method(
         "final_ref_nrmse": normalized_rmse(final_ref, gt_img, mask),
         "corrected_mean_nrmse": normalized_rmse(mean_corrected, gt_img, mask),
         "corrected_mean_corr": normalized_corr(mean_corrected, gt_img, mask),
+        "global_gauge_angle_deg": global_angle,
+        "global_gauge_dy_px": global_dy,
+        "global_gauge_dx_px": global_dx,
+        "global_gauge_score": global_score,
+        "gauge_corrected_mean_nrmse": normalized_rmse(gauge_corrected_mean, gt_img, mask),
+        "gauge_corrected_mean_corr": normalized_corr(gauge_corrected_mean, gt_img, mask),
+        "gauge_corrected_particle_nrmse_mean": float(np.mean(gauge_particle_nrmse)),
+        "gauge_corrected_particle_corr_mean": float(np.mean(gauge_particle_corr)),
+        "angle_mae_gauge_corrected_deg": float(np.mean(np.abs(angle_error_gauge_corrected))),
+        "angle_rmse_gauge_corrected_deg": float(np.sqrt(np.mean(angle_error_gauge_corrected**2))),
     }
-    return MethodResult(name, engine, elapsed_s, params, final_ref, corrected, metrics, summary)
+    return MethodResult(
+        name,
+        engine,
+        elapsed_s,
+        params,
+        final_ref,
+        corrected,
+        metrics,
+        summary,
+        final_ref_global_corrected=final_ref_global_corrected,
+        gauge_corrected_stack=gauge_corrected_stack,
+    )
 
 
 def write_ground_truth_csv(path: Path, gt_table: np.ndarray) -> None:
@@ -260,26 +319,49 @@ def write_particle_csv(path: Path, result: MethodResult, gt_table: np.ndarray) -
 
 
 def plot_overview(output_path: Path, gt_img: np.ndarray, raw_stack: np.ndarray, results: list[MethodResult]) -> None:
-    rows = 2
-    cols = 2 + len(results)
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 8), squeeze=False)
+    rows = max(1, len(results))
+    cols = 6
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), squeeze=False)
 
-    images_top = [("Ground truth", gt_img), ("Raw average", np.mean(raw_stack, axis=0))]
-    images_bottom = [("GT", gt_img), ("Raw avg", np.mean(raw_stack, axis=0))]
-    for result in results:
-        images_top.append((f"{result.name}\nfinal ref", result.final_ref))
-        images_bottom.append((f"{result.name}\ncorrected avg", np.mean(result.corrected_stack, axis=0)))
-
+    raw_avg = np.mean(raw_stack, axis=0)
     vmin, vmax = np.percentile(gt_img, [1, 99])
-    for ax, (title, img) in zip(axes[0], images_top):
-        ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
-        ax.set_title(title)
-        ax.axis("off")
-    for ax, (title, img) in zip(axes[1], images_bottom):
-        ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
-        ax.set_title(title)
-        ax.axis("off")
+    for r, result in enumerate(results):
+        final_ref_global_corrected = result.final_ref_global_corrected if result.final_ref_global_corrected is not None else result.final_ref
+        gauge_stack = result.gauge_corrected_stack if result.gauge_corrected_stack is not None else result.corrected_stack
+        gauge_corrected_mean = np.mean(gauge_stack, axis=0)
+        row_imgs = [
+            ("GT", gt_img),
+            ("Raw average", raw_avg),
+            (f"{result.name}\nfinal_ref", result.final_ref),
+            (f"{result.name}\nfinal_ref global", final_ref_global_corrected),
+            (f"{result.name}\ncorrected avg", np.mean(result.corrected_stack, axis=0)),
+            (f"{result.name}\ngauge-corr avg", gauge_corrected_mean),
+        ]
+        for c, (title, img) in enumerate(row_imgs):
+            ax = axes[r, c]
+            ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
+            ax.set_title(title)
+            ax.axis("off")
 
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_angle_error_histograms(output_path: Path, results: list[MethodResult]) -> None:
+    if not results:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for result in results:
+        axes[0].hist(result.particle_metrics["raw_angle_error_deg"], bins=48, alpha=0.45, label=result.name)
+        axes[1].hist(result.particle_metrics["angle_error_gauge_corrected_deg"], bins=48, alpha=0.45, label=result.name)
+    axes[0].set_title("Raw angle error histogram")
+    axes[1].set_title("Gauge-corrected angle error histogram")
+    for ax in axes:
+        ax.set_xlabel("Signed angle error (deg)")
+        ax.set_ylabel("Particles")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
@@ -595,6 +677,7 @@ def main() -> None:
             mask,
             elapsed,
             meta["engine"],
+            geo,
         )
         results.append(result)
         diagnostics = meta.get("candidate_diagnostics", [])
@@ -613,6 +696,7 @@ def main() -> None:
     plot_overview(output_dir / "overview.png", gt_img, stack, results)
     plot_error_distributions(output_dir / "error_distributions.png", results)
     plot_parameter_scatter(output_dir / "parameter_scatter.png", gt_table, results)
+    plot_angle_error_histograms(output_dir / "angle_error_histograms.png", results)
     plot_angle_error_comparison(output_dir / "angle_error_comparison.png", results)
     plot_selected_rank_histogram(output_dir / "selected_candidate_rank.png", diagnostics_by_method)
 
