@@ -27,6 +27,13 @@ import matplotlib.pyplot as plt
 import align_utils as au
 import alignimg_api as api
 
+try:
+    import align_single as single
+    HAS_ALIGN_SINGLE = True
+except ImportError:
+    single = None
+    HAS_ALIGN_SINGLE = False
+
 
 @dataclass(frozen=True)
 class MethodConfig:
@@ -34,6 +41,7 @@ class MethodConfig:
     use_gpu: bool
     n_jobs: int | None
     use_multicandidate: bool = False
+    backend: str = "api"
 
 
 @dataclass
@@ -619,8 +627,13 @@ def available_methods(requested: str) -> list[MethodConfig]:
         "cpu-parallel": MethodConfig("cpu-parallel", use_gpu=False, n_jobs=-1),
         "gpu": MethodConfig("gpu", use_gpu=True, n_jobs=None),
     }
+    if HAS_ALIGN_SINGLE:
+        method_map["align-single-clean"] = MethodConfig("align-single-clean", use_gpu=False, n_jobs=1, backend="single")
     if requested == "all":
-        names = ["cpu-serial", "cpu-parallel"]
+        names = []
+        if HAS_ALIGN_SINGLE:
+            names.append("align-single-clean")
+        names.extend(["cpu-serial", "cpu-parallel"])
         if api.HAS_GPU:
             names.append("gpu")
         return [method_map[name] for name in names]
@@ -636,7 +649,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-angle", type=float, default=170.0, help="Maximum absolute applied rotation in degrees.")
     parser.add_argument("--iterations", type=int, default=4, help="Alignment iterations passed to run_alignment().")
     parser.add_argument("--mask-diameter", type=float, default=None, help="Circular mask diameter; default is 82%% of image size.")
-    parser.add_argument("--methods", default="all", help="Comma-separated methods: cpu-serial,cpu-parallel,gpu or all.")
+    parser.add_argument("--methods", default="all", help="Comma-separated methods: align-single-clean,cpu-serial,cpu-parallel,gpu or all.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--output-dir", default="accuracy_report", help="Directory for CSV and PNG outputs.")
     parser.add_argument("--gpu-batch-size", type=int, default=256, help="Batch size for GPU method.")
@@ -702,7 +715,7 @@ def main() -> None:
     if args.use_multicandidate:
         expanded_methods: list[MethodConfig] = []
         for method in methods:
-            if method.use_gpu:
+            if method.use_gpu or method.backend == "single":
                 expanded_methods.append(method)
             else:
                 expanded_methods.append(MethodConfig(f"{method.name}-single", method.use_gpu, method.n_jobs, False))
@@ -714,21 +727,36 @@ def main() -> None:
     for method in methods:
         print(f"\n=== Running {method.name} ===")
         start = time.perf_counter()
-        final_ref, _history, params, meta = api.run_alignment(
-            stack,
-            init_ref,
-            num_iterations=args.iterations,
-            mask_diameter=mask_diameter,
-            use_gpu=method.use_gpu,
-            n_jobs=method.n_jobs,
-            batch_size=args.gpu_batch_size,
-            verbose=args.verbose,
-            use_multicandidate=method.use_multicandidate and not method.use_gpu,
-            topk_initial=args.topk_initial,
-            diagnostics_n=args.diagnostics_n if (method.use_multicandidate and not method.use_gpu) else 0,
-        )
-        elapsed = time.perf_counter() - start
-        corrected = api.run_transform(stack, params, engine=meta["engine"])
+        if method.backend == "single":
+            final_ref, _history, params, _single_meta = single.run_alignment_single(
+                stack,
+                init_ref,
+                num_iterations=args.iterations,
+                mask_diameter=mask_diameter,
+                verbose=args.verbose,
+            )
+            meta = {
+                "engine": "align-single-clean",
+                "candidate_diagnostics": [],
+            }
+            elapsed = time.perf_counter() - start
+            corrected = single.run_transform_single(stack, params)
+        else:
+            final_ref, _history, params, meta = api.run_alignment(
+                stack,
+                init_ref,
+                num_iterations=args.iterations,
+                mask_diameter=mask_diameter,
+                use_gpu=method.use_gpu,
+                n_jobs=method.n_jobs,
+                batch_size=args.gpu_batch_size,
+                verbose=args.verbose,
+                use_multicandidate=method.use_multicandidate and not method.use_gpu,
+                topk_initial=args.topk_initial,
+                diagnostics_n=args.diagnostics_n if (method.use_multicandidate and not method.use_gpu) else 0,
+            )
+            elapsed = time.perf_counter() - start
+            corrected = api.run_transform(stack, params, engine=meta["engine"])
         result = evaluate_method(
             method.name,
             final_ref,
