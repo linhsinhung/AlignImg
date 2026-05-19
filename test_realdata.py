@@ -10,21 +10,11 @@ import os
 import gc
 import time
 import numpy as np
-import multiprocessing
 from tqdm import tqdm
 
-# === Imports & GPU Check ===
+# === Imports ===
 import align_utils as au
-
-try:
-    import cupy as cp
-    import align_utils_gpu as aug
-    HAS_GPU = True
-except ImportError:
-    HAS_GPU = False
-    aug = None
-    
-from alignimg_api import run_alignment, run_transform    
+from alignimg_api import run_alignment, run_transform, available_backends
     
 
 
@@ -71,26 +61,16 @@ def plot_results(final_ref, X_raw, gt_img=None, save_path="alignment_result.png"
     plt.savefig(save_path)
     print(f">> Plot saved to {save_path}")
 
-def save_alignment_results(params, com_offsets, output_path="alignment_results.csv"):
-    if hasattr(params, 'get'):
-        params = params.get()
-    if hasattr(com_offsets, 'get'):
-        com_offsets = com_offsets.get()
-       
+def save_alignment_results(params, output_path="alignment_results.csv"):
     N = params.shape[0]
     df = pd.DataFrame({
-        'Particle_Idx': np.arange(N),
-        'CoM_Dy': com_offsets[:, 0],
-        'CoM_Dx': com_offsets[:, 1],
-        'Align_Dy': params[:, 1],
-        'Align_Dx': params[:, 2],
-        'Angle_Psi': params[:, 0],
-        'Score': params[:, 3]
+        "Particle_Idx": np.arange(N),
+        "Angle_Psi": params[:, 0],
+        "Align_Dy": params[:, 1],
+        "Align_Dx": params[:, 2],
+        "Score": params[:, 3],
     })
-    df['Total_Dy'] = df['CoM_Dy'] + df['Align_Dy']
-    df['Total_Dx'] = df['CoM_Dx'] + df['Align_Dx']
-    
-    df.to_csv(output_path, index=False, float_format='%.6f')
+    df.to_csv(output_path, index=False, float_format="%.6f")
     print(f">> Parameters saved to: {os.path.abspath(output_path)}")
     return df
 
@@ -101,11 +81,8 @@ if __name__ == "__main__":
     import mrcfile
     import pandas as pd
 
-    multiprocessing.freeze_support()
-    
     # --- Configuration ---
-    USE_GPU_FLAG = True   # Change this to test switching
-    N_JOBS = -1           # 1 for Serial, -1 for Parallel
+    BACKEND = "single"   # available: single / multicore / gpu
     
     path_data = './test_align.mrcs'
     path_gt = './mu_aligned_mean.mrc'
@@ -129,13 +106,13 @@ if __name__ == "__main__":
     # --- Run API ---
     start_time = time.time()
     
+    print("Available backends:", available_backends())
     final_ref, history, params, meta = run_alignment(
-        X_data, 
-        init_ref, 
-        num_iterations=4, 
+        X_data,
+        init_ref,
+        num_iterations=4,
         mask_diameter=75,
-        use_gpu=USE_GPU_FLAG,
-        n_jobs=N_JOBS
+        backend=BACKEND,
     )
     
     elapsed = time.time() - start_time
@@ -143,7 +120,7 @@ if __name__ == "__main__":
     
     # --- Output ---
     plot_results(final_ref, X_data, gt_img=gt_img, save_path="api_result.png")
-    save_alignment_results(params, meta["com_offsets"], "api_params.csv")
+    save_alignment_results(params, "api_params.csv")
 
     # --- Apply Transform & Visual Check ---
     X_corrected = run_transform(X_data, params, engine=meta["engine"])
