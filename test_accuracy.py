@@ -728,11 +728,12 @@ def main() -> None:
         print(f"\n=== Running {method.name} ===")
         start = time.perf_counter()
         if method.backend == "single":
-            final_ref, _history, params, _single_meta = single.run_alignment_single(
+            final_ref, _history, params, meta = api.run_alignment(
                 stack,
                 init_ref,
                 num_iterations=args.iterations,
                 mask_diameter=mask_diameter,
+                backend="single",
                 verbose=args.verbose,
             )
             meta = {
@@ -740,7 +741,11 @@ def main() -> None:
                 "candidate_diagnostics": [],
             }
             elapsed = time.perf_counter() - start
-            corrected = single.run_transform_single(stack, params)
+            corrected = api.run_transform(
+                stack,
+                params,
+                backend="single",
+            )
         else:
             final_ref, _history, params, meta = api.run_alignment(
                 stack,
