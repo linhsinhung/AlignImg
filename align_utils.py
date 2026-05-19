@@ -207,3 +207,80 @@ def local_joint_search(img, ref, geo, center_angle, angle_range=5.0, angle_step=
     if results:
         return results[0]
     return {"angle": 0.0, "dy": 0.0, "dx": 0.0, "score": 0.0, "fft_score": 0.0}
+
+
+
+def default_iter_schedule(it: int, num_iterations: int) -> dict:
+    if it == 0:
+        return {"mode": "global", "lp_sigma": 3.0}
+    if it == 1:
+        return {"mode": "local", "angle_range": 8.0, "angle_step": 2.0, "lp_sigma": 1.0}
+    if it == 2:
+        return {"mode": "local", "angle_range": 4.0, "angle_step": 1.0, "lp_sigma": 0.0}
+    return {"mode": "local", "angle_range": 2.0, "angle_step": 0.5, "lp_sigma": 0.0}
+
+
+def align_one_single_cpu(img, ref_match, geo, prev_angle, schedule):
+    if schedule["mode"] == "global":
+        best = coarse_to_fine_joint_search(img, ref_match, geo)
+    else:
+        best = local_joint_search(
+            img,
+            ref_match,
+            geo,
+            center_angle=float(prev_angle),
+            angle_range=float(schedule["angle_range"]),
+            angle_step=float(schedule["angle_step"]),
+        )
+
+    angle = float(best["angle"])
+    dy = float(best["dy"])
+    dx = float(best["dx"])
+    score = float(best["score"])
+    aligned_img = transform_final_image(img, geo, angle, dy, dx)
+    params = np.array([angle, dy, dx, score], dtype=np.float32)
+    return params, aligned_img
+
+
+def run_alignment_single_cpu(X, initial_ref, num_iterations=4, mask_diameter=None, verbose=True):
+    X = np.asarray(X, dtype=np.float32)
+    initial_ref = np.asarray(initial_ref, dtype=np.float32)
+    n = int(X.shape[0])
+    geo = get_geometry_context(X.shape)
+    params = np.zeros((n, 4), dtype=np.float32)
+    current_ref = apply_circular_mask(initial_ref, geo, diameter=mask_diameter)
+    history_refs = [current_ref.copy()]
+
+    for it in range(int(num_iterations)):
+        schedule = default_iter_schedule(it, int(num_iterations))
+        if verbose:
+            print(f"[iter {it + 1}/{num_iterations}] mode={schedule['mode']} lp_sigma={schedule['lp_sigma']}")
+        ref_match = apply_lowpass_filter(current_ref, schedule["lp_sigma"])
+        accum = np.zeros_like(current_ref, dtype=np.float32)
+        for i in range(n):
+            params_i, aligned_i = align_one_single_cpu(X[i], ref_match, geo, prev_angle=float(params[i, 0]), schedule=schedule)
+            params[i] = params_i
+            accum += aligned_i
+        current_ref = accum / max(n, 1)
+        current_ref = apply_circular_mask(current_ref, geo, diameter=mask_diameter)
+        history_refs.append(current_ref.copy())
+
+    meta = {
+        "backend": "single",
+        "engine": "align-single-clean",
+        "num_iterations": int(num_iterations),
+        "mask_diameter": mask_diameter,
+        "num_particles": n,
+        "implemented": True,
+    }
+    return current_ref, history_refs, params, meta
+
+
+def run_transform_single_cpu(X, params):
+    X = np.asarray(X, dtype=np.float32)
+    params = np.asarray(params, dtype=np.float32)
+    geo = get_geometry_context(X.shape)
+    out = np.zeros_like(X, dtype=np.float32)
+    for i in range(X.shape[0]):
+        out[i] = transform_final_image(X[i], geo, params[i, 0], params[i, 1], params[i, 2])
+    return out

@@ -27,13 +27,6 @@ import matplotlib.pyplot as plt
 import align_utils as au
 import alignimg_api as api
 
-try:
-    import align_single as single
-    HAS_ALIGN_SINGLE = True
-except ImportError:
-    single = None
-    HAS_ALIGN_SINGLE = False
-
 
 @dataclass(frozen=True)
 class MethodConfig:
@@ -623,20 +616,12 @@ def run_legacy_k1_parity_check(
 
 def available_methods(requested: str) -> list[MethodConfig]:
     method_map = {
-        "cpu-serial": MethodConfig("cpu-serial", use_gpu=False, n_jobs=1),
-        "cpu-parallel": MethodConfig("cpu-parallel", use_gpu=False, n_jobs=-1),
-        "gpu": MethodConfig("gpu", use_gpu=True, n_jobs=None),
+        "align-single-clean": MethodConfig("align-single-clean", use_gpu=False, n_jobs=1, backend="single"),
+        "multicore": MethodConfig("multicore", use_gpu=False, n_jobs=None, backend="multicore"),
+        "gpu": MethodConfig("gpu", use_gpu=True, n_jobs=None, backend="gpu"),
     }
-    if HAS_ALIGN_SINGLE:
-        method_map["align-single-clean"] = MethodConfig("align-single-clean", use_gpu=False, n_jobs=1, backend="single")
     if requested == "all":
-        names = []
-        if HAS_ALIGN_SINGLE:
-            names.append("align-single-clean")
-        names.extend(["cpu-serial", "cpu-parallel"])
-        if api.HAS_GPU:
-            names.append("gpu")
-        return [method_map[name] for name in names]
+        return [method_map["align-single-clean"]]
     return [method_map[name.strip()] for name in requested.split(",") if name.strip()]
 
 
@@ -649,7 +634,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-angle", type=float, default=170.0, help="Maximum absolute applied rotation in degrees.")
     parser.add_argument("--iterations", type=int, default=4, help="Alignment iterations passed to run_alignment().")
     parser.add_argument("--mask-diameter", type=float, default=None, help="Circular mask diameter; default is 82%% of image size.")
-    parser.add_argument("--methods", default="all", help="Comma-separated methods: align-single-clean,cpu-serial,cpu-parallel,gpu or all.")
+    parser.add_argument("--methods", default="all", help="Comma-separated methods: align-single-clean,multicore,gpu or all.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--output-dir", default="accuracy_report", help="Directory for CSV and PNG outputs.")
     parser.add_argument("--gpu-batch-size", type=int, default=256, help="Batch size for GPU method.")
@@ -700,68 +685,23 @@ def main() -> None:
         print("End-to-end raw-average mode: GT pose comparison is strict and may include global reference-frame ambiguity.")
     write_ground_truth_csv(output_dir / "ground_truth_params.csv", gt_table)
 
-    if args.check_legacy_k1:
-        run_legacy_k1_parity_check(
-            stack=stack,
-            init_ref=init_ref,
-            num_iterations=args.iterations,
-            mask_diameter=mask_diameter,
-            output_dir=output_dir,
-            tolerance=args.legacy_k1_tol,
-            verbose=args.verbose,
-        )
-
     methods = available_methods(args.methods)
-    if args.use_multicandidate:
-        expanded_methods: list[MethodConfig] = []
-        for method in methods:
-            if method.use_gpu or method.backend == "single":
-                expanded_methods.append(method)
-            else:
-                expanded_methods.append(MethodConfig(f"{method.name}-single", method.use_gpu, method.n_jobs, False))
-                expanded_methods.append(MethodConfig(f"{method.name}-multicandidate", method.use_gpu, method.n_jobs, True))
-        methods = expanded_methods
 
     results: list[MethodResult] = []
     diagnostics_by_method: dict[str, list[dict]] = {}
     for method in methods:
         print(f"\n=== Running {method.name} ===")
         start = time.perf_counter()
-        if method.backend == "single":
-            final_ref, _history, params, meta = api.run_alignment(
-                stack,
-                init_ref,
-                num_iterations=args.iterations,
-                mask_diameter=mask_diameter,
-                backend="single",
-                verbose=args.verbose,
-            )
-            meta = {
-                "engine": "align-single-clean",
-                "candidate_diagnostics": [],
-            }
-            elapsed = time.perf_counter() - start
-            corrected = api.run_transform(
-                stack,
-                params,
-                backend="single",
-            )
-        else:
-            final_ref, _history, params, meta = api.run_alignment(
-                stack,
-                init_ref,
-                num_iterations=args.iterations,
-                mask_diameter=mask_diameter,
-                use_gpu=method.use_gpu,
-                n_jobs=method.n_jobs,
-                batch_size=args.gpu_batch_size,
-                verbose=args.verbose,
-                use_multicandidate=method.use_multicandidate and not method.use_gpu,
-                topk_initial=args.topk_initial,
-                diagnostics_n=args.diagnostics_n if (method.use_multicandidate and not method.use_gpu) else 0,
-            )
-            elapsed = time.perf_counter() - start
-            corrected = api.run_transform(stack, params, engine=meta["engine"])
+        final_ref, _history, params, meta = api.run_alignment(
+            stack,
+            init_ref,
+            num_iterations=args.iterations,
+            mask_diameter=mask_diameter,
+            backend=method.backend,
+            verbose=args.verbose,
+        )
+        elapsed = time.perf_counter() - start
+        corrected = api.run_transform(stack, params, backend=method.backend, engine=meta.get("engine"))
         result = evaluate_method(
             method.name,
             final_ref,
@@ -808,5 +748,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     # Make multiprocessing safe on platforms that use spawn.
-    api.multiprocessing.freeze_support()
     main()
