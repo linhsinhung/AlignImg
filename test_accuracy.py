@@ -214,6 +214,20 @@ def evaluate_method(
     global_angle_offset = float(np.rad2deg(np.angle(np.mean(np.exp(1j * np.deg2rad(raw_angle_error))))))
     angle_error_gauge_corrected = angle_diff_deg(params[:, 0] - global_angle_offset, ideal_angle).astype(np.float32)
 
+    params_angle = params[:, 0]
+    params_dy = params[:, 1]
+    params_dx = params[:, 2]
+    combined_angle = angle_diff_deg(params_angle + global_angle, 0.0).astype(np.float32)
+    theta = np.deg2rad(global_angle)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    combined_dx = (cos_t * params_dx + sin_t * params_dy + global_dx).astype(np.float32)
+    combined_dy = (-sin_t * params_dx + cos_t * params_dy + global_dy).astype(np.float32)
+
+    dy_error_gauge_corrected = (combined_dy - ideal_dy).astype(np.float32)
+    dx_error_gauge_corrected = (combined_dx - ideal_dx).astype(np.float32)
+    shift_error_gauge_corrected = np.sqrt(dy_error_gauge_corrected**2 + dx_error_gauge_corrected**2).astype(np.float32)
+
     gauge_particle_nrmse = np.array([normalized_rmse(img, gt_img, mask) for img in gauge_corrected_stack], dtype=np.float32)
     gauge_particle_corr = np.array([normalized_corr(img, gt_img, mask) for img in gauge_corrected_stack], dtype=np.float32)
 
@@ -227,6 +241,12 @@ def evaluate_method(
         "score": params[:, 3].astype(np.float32),
         "raw_angle_error_deg": raw_angle_error,
         "angle_error_gauge_corrected_deg": angle_error_gauge_corrected,
+        "combined_angle_deg": combined_angle,
+        "combined_dy_px": combined_dy,
+        "combined_dx_px": combined_dx,
+        "dy_error_gauge_corrected_px": dy_error_gauge_corrected,
+        "dx_error_gauge_corrected_px": dx_error_gauge_corrected,
+        "shift_error_gauge_corrected_px": shift_error_gauge_corrected,
     }
     summary: dict[str, float | str] = {
         "method": name,
@@ -253,6 +273,10 @@ def evaluate_method(
         "gauge_corrected_particle_corr_mean": float(np.mean(gauge_particle_corr)),
         "angle_mae_gauge_corrected_deg": float(np.mean(np.abs(angle_error_gauge_corrected))),
         "angle_rmse_gauge_corrected_deg": float(np.sqrt(np.mean(angle_error_gauge_corrected**2))),
+        "dy_mae_gauge_corrected_px": float(np.mean(np.abs(dy_error_gauge_corrected))),
+        "dx_mae_gauge_corrected_px": float(np.mean(np.abs(dx_error_gauge_corrected))),
+        "shift_mae_gauge_corrected_px": float(np.mean(shift_error_gauge_corrected)),
+        "shift_rmse_gauge_corrected_px": float(np.sqrt(np.mean(shift_error_gauge_corrected**2))),
     }
     return MethodResult(
         name,
@@ -297,6 +321,7 @@ def write_particle_csv(path: Path, result: MethodResult, gt_table: np.ndarray) -
         "ideal_angle_deg", "ideal_dy_px", "ideal_dx_px",
         "estimated_angle_deg", "estimated_dy_px", "estimated_dx_px", "score",
         "angle_error_deg", "dy_error_px", "dx_error_px", "shift_error_px",
+        "angle_error_gauge_corrected_deg", "dy_error_gauge_corrected_px", "dx_error_gauge_corrected_px", "shift_error_gauge_corrected_px",
         "particle_nrmse", "particle_corr",
     ]
     with path.open("w", newline="") as f:
@@ -312,6 +337,10 @@ def write_particle_csv(path: Path, result: MethodResult, gt_table: np.ndarray) -
                 result.particle_metrics["dy_error_px"][i],
                 result.particle_metrics["dx_error_px"][i],
                 result.particle_metrics["shift_error_px"][i],
+                result.particle_metrics["angle_error_gauge_corrected_deg"][i],
+                result.particle_metrics["dy_error_gauge_corrected_px"][i],
+                result.particle_metrics["dx_error_gauge_corrected_px"][i],
+                result.particle_metrics["shift_error_gauge_corrected_px"][i],
                 result.particle_metrics["particle_nrmse"][i],
                 result.particle_metrics["particle_corr"][i],
             ]
@@ -422,6 +451,39 @@ def plot_parameter_scatter(output_path: Path, gt_table: np.ndarray, results: lis
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
+
+
+
+
+def plot_parameter_scatter_gauge_corrected(output_path: Path, gt_table: np.ndarray, results: list[MethodResult]) -> None:
+    rows = len(results)
+    if rows == 0:
+        return
+    fig, axes = plt.subplots(rows, 3, figsize=(15, 4 * rows), squeeze=False)
+    ideal = [gt_table[:, 3], gt_table[:, 4], gt_table[:, 5]]
+    names = ["Angle (deg)", "Dy (px)", "Dx (px)"]
+
+    for r, result in enumerate(results):
+        estimates = [
+            result.particle_metrics["combined_angle_deg"],
+            result.particle_metrics["combined_dy_px"],
+            result.particle_metrics["combined_dx_px"],
+        ]
+        for c, (ideal_values, estimated_values, label) in enumerate(zip(ideal, estimates, names)):
+            ax = axes[r, c]
+            ax.scatter(ideal_values, estimated_values, s=12, alpha=0.7)
+            lo = float(min(np.min(ideal_values), np.min(estimated_values)))
+            hi = float(max(np.max(ideal_values), np.max(estimated_values)))
+            pad = max((hi - lo) * 0.05, 1e-3)
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=1)
+            ax.set_xlabel(f"Ideal {label}")
+            ax.set_ylabel(f"Gauge-corrected estimated {label}")
+            ax.set_title(f"{result.name}: gauge-corrected estimated vs ideal {label}")
+            ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
 
 
 def write_candidate_diagnostics_csv(path: Path, diagnostics: list[dict], gt_table: np.ndarray) -> None:
@@ -696,6 +758,7 @@ def main() -> None:
     plot_overview(output_dir / "overview.png", gt_img, stack, results)
     plot_error_distributions(output_dir / "error_distributions.png", results)
     plot_parameter_scatter(output_dir / "parameter_scatter.png", gt_table, results)
+    plot_parameter_scatter_gauge_corrected(output_dir / "parameter_scatter_gauge_corrected.png", gt_table, results)
     plot_angle_error_histograms(output_dir / "angle_error_histograms.png", results)
     plot_angle_error_comparison(output_dir / "angle_error_comparison.png", results)
     plot_selected_rank_histogram(output_dir / "selected_candidate_rank.png", diagnostics_by_method)
@@ -706,6 +769,7 @@ def main() -> None:
     print(f"  - {output_dir / 'overview.png'}")
     print(f"  - {output_dir / 'error_distributions.png'}")
     print(f"  - {output_dir / 'parameter_scatter.png'}")
+    print(f"  - {output_dir / 'parameter_scatter_gauge_corrected.png'}")
     print(f"  - {output_dir / 'angle_error_comparison.png'}")
 
 
