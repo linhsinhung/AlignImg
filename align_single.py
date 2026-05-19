@@ -11,11 +11,9 @@ from align_utils import (
     get_geometry_context,
     apply_circular_mask,
     apply_lowpass_filter,
-    rotate_image,
-    get_best_translation_fft,
     transform_final_image,
-    normalized_cross_correlation,
     coarse_to_fine_joint_search,
+    local_joint_search,
 )
 
 
@@ -29,33 +27,6 @@ def single_iter_schedule(it: int, num_iterations: int) -> dict:
         return {"mode": "local", "angle_range": 4.0, "angle_step": 1.0, "lp_sigma": 0.0}
     return {"mode": "local", "angle_range": 2.0, "angle_step": 0.5, "lp_sigma": 0.0}
 
-
-def local_joint_search(img, ref, geo, center_angle, angle_range, angle_step) -> dict:
-    """Joint local angle/translation search around center_angle."""
-    best = None
-    angles = np.arange(
-        center_angle - angle_range,
-        center_angle + angle_range + 0.5 * angle_step,
-        angle_step,
-        dtype=np.float32,
-    )
-    for angle in angles:
-        rotated = rotate_image(img, geo, float(angle))
-        obs_dy, obs_dx, fft_score = get_best_translation_fft(rotated, ref, geo)
-        dy = -float(obs_dy)
-        dx = -float(obs_dx)
-        corrected = transform_final_image(img, geo, float(angle), dy, dx)
-        score = normalized_cross_correlation(corrected, ref)
-        cand = {
-            "angle": float(angle),
-            "dy": dy,
-            "dx": dx,
-            "score": float(score),
-            "fft_score": float(fft_score),
-        }
-        if (best is None) or (cand["score"] > best["score"]):
-            best = cand
-    return best if best is not None else {"angle": 0.0, "dy": 0.0, "dx": 0.0, "score": 0.0, "fft_score": 0.0}
 
 
 def align_one_single(img, ref_match, geo, prev_angle, schedule):
@@ -77,6 +48,7 @@ def align_one_single(img, ref_match, geo, prev_angle, schedule):
     dx = float(best["dx"])
     score = float(best["score"])
     aligned_img = transform_final_image(img, geo, angle, dy, dx)
+    # Convention: params = [angle, dy, dx, score] and are directly reusable in transform_final_image.
     params = np.array([angle, dy, dx, score], dtype=np.float32)
     return params, aligned_img
 
