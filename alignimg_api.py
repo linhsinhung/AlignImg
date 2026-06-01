@@ -4,6 +4,7 @@
 
 Formal architecture:
     align_utils.py     : CPU primitives + CPU single-process backends
+    align_multicore.py : multi-core CPU MAP-EM backend
     alignimg_api.py    : public interface / backend dispatcher
     align_utils_gpu.py : future GPU backend
 
@@ -32,8 +33,8 @@ _BACKEND_INFO = {
         "description": "Single-process CPU backend using clean align_utils primitives.",
     },
     "multicore": {
-        "implemented": False,
-        "description": "Future multi-core CPU backend using the same clean transform convention.",
+        "implemented": True,
+        "description": "Multi-core CPU backend using particle-level parallel MAP-EM E-step.",
     },
     "gpu": {
         "implemented": False,
@@ -151,6 +152,8 @@ def run_alignment(
     algorithm: str = "mapem",
     verbose: bool = True,
     config: Optional[au.MAPEMConfig] = None,
+    n_jobs=None,
+    chunksize=1,
     **kwargs,
 ):
     """Run alignment through the public backend dispatcher.
@@ -158,8 +161,8 @@ def run_alignment(
     Parameters
     ----------
     backend:
-        Currently implemented: "single".
-        Reserved stubs: "multicore", "gpu".
+        Currently implemented: "single" and "multicore" for MAP-EM.
+        Reserved stub: "gpu".
 
     algorithm:
         "mapem"  -> robust MAP-EM backend; default recommended algorithm.
@@ -176,10 +179,25 @@ def run_alignment(
     algorithm = normalize_algorithm_name(algorithm)
 
     if backend == "multicore":
-        raise NotImplementedError(
-            "The multicore backend is reserved for future implementation. "
-            "Use backend='single' for the current implementation."
+        if algorithm == "classic":
+            raise NotImplementedError(
+                "multicore classic backend is not implemented; "
+                "use algorithm='mapem' or backend='single'."
+            )
+        import align_multicore as amc
+
+        cfg = config if config is not None else make_mapem_config(**kwargs)
+        return amc.run_alignment_mapem_multicore(
+            X,
+            initial_ref,
+            num_iterations=num_iterations,
+            mask_diameter=mask_diameter,
+            config=cfg,
+            verbose=verbose,
+            n_jobs=n_jobs,
+            chunksize=chunksize,
         )
+
     if backend == "gpu":
         raise NotImplementedError(
             "The GPU backend is reserved for future implementation. "
@@ -218,6 +236,7 @@ def run_transform(
     backend: str = "single",
     engine: Optional[str] = None,
     algorithm: Optional[str] = None,
+    n_jobs=None,
     **kwargs,
 ):
     """Apply final transform parameters.
@@ -235,7 +254,11 @@ def run_transform(
             algorithm = "classic"
 
     backend = normalize_backend_name(backend)
-    if backend in {"multicore", "gpu"}:
+    if backend == "multicore":
+        import align_multicore as amc
+
+        return amc.run_transform_multicore(X, params, n_jobs=n_jobs)
+    if backend == "gpu":
         raise NotImplementedError(f"{backend} backend is not implemented yet")
     if backend != "single":
         raise ValueError(f"Unsupported backend: {backend}")
