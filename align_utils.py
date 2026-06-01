@@ -492,6 +492,8 @@ def local_mapem_search(img, ref, geo, center_angle: float, schedule: dict, cfg: 
         "score": 0.0,
         "image_score": 0.0,
         "posterior_score": 0.0,
+        "translation_prior_score": 0.0,
+        "angle_prior_score": 0.0,
         "fft_score": 0.0,
         "all_candidates": [],
         "n_evaluations": 0,

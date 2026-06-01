@@ -53,7 +53,17 @@ START_INDEX = 0
 # Alignment settings
 NUM_ITERATIONS = 4
 MASK_DIAMETER = 80.0
-BACKEND = "single"
+
+# Backends to exercise through the public API. Keep "single" first as the
+# correctness baseline; include "multicore" to apply the process-parallel
+# MAP-EM backend to the same phase/configuration sweep.
+BACKENDS = ["single", "multicore"]
+
+# Multicore backend controls. N_JOBS = None lets align_multicore choose
+# min(os.cpu_count(), num_particles). Keep CHUNKSIZE conservative for the
+# first correctness-focused multicore backend.
+N_JOBS = 4
+CHUNKSIZE = 1
 
 # Optional GT display/evaluation correction
 APPLY_GT_ROTATION = True
@@ -319,6 +329,7 @@ def estimate_gauge_if_reference_exists(
 
 def summarize_run(
     name: str,
+    backend: str,
     cfg,
     algorithm: str,
     elapsed: float,
@@ -344,7 +355,7 @@ def summarize_run(
 
     row = {
         "method": name,
-        "backend": BACKEND,
+        "backend": backend,
         "algorithm": algorithm,
         "phase": cfg_dict.get("phase", np.nan),
         "weight_mode": cfg_dict.get("weight_mode", ""),
@@ -576,82 +587,94 @@ def run_three_phase_demo():
     init_ref = raw_avg.copy()
 
     configs = make_phase_configs()
+    backends = [str(b).strip().lower() for b in BACKENDS]
     results = []
     summary_rows = []
 
-    for name, spec in configs.items():
-        cfg = spec["config"]
-        algorithm = spec.get("algorithm", "mapem")
-        print(f"\n=== Running {name} through alignimg_api ===")
-        print(f"algorithm={algorithm}, backend={BACKEND}")
-        print(f"config: {config_to_dict(cfg)}")
-        t0 = time.perf_counter()
-        final_ref, history, params, meta = api.run_alignment(
-            X,
-            init_ref,
-            num_iterations=NUM_ITERATIONS,
-            mask_diameter=MASK_DIAMETER,
-            backend=BACKEND,
-            algorithm=algorithm,
-            config=cfg,
-            verbose=True,
-        )
-        corrected = api.run_transform(
-            X,
-            params,
-            backend=BACKEND,
-            algorithm=algorithm,
-        )
-        elapsed = time.perf_counter() - t0
-        corrected_mean = np.mean(corrected, axis=0).astype(np.float32)
+    for backend in backends:
+        for phase_name, spec in configs.items():
+            cfg = spec["config"]
+            algorithm = spec.get("algorithm", "mapem")
+            run_name = f"{backend}_{phase_name}"
+            print(f"\n=== Running {run_name} through alignimg_api ===")
+            print(f"algorithm={algorithm}, backend={backend}")
+            if backend == "multicore":
+                print(f"multicore controls: n_jobs={N_JOBS}, chunksize={CHUNKSIZE}")
+            print(f"config: {config_to_dict(cfg)}")
 
-        summary, gauge = summarize_run(
-            name=name,
-            cfg=cfg,
-            algorithm=algorithm,
-            elapsed=elapsed,
-            final_ref=final_ref,
-            corrected=corrected,
-            params=params,
-            meta=meta,
-            gt_img=gt_img,
-            geo=geo,
-            mask=mask,
-        )
-        summary_rows.append(summary)
+            t0 = time.perf_counter()
+            final_ref, history, params, meta = api.run_alignment(
+                X,
+                init_ref,
+                num_iterations=NUM_ITERATIONS,
+                mask_diameter=MASK_DIAMETER,
+                backend=backend,
+                algorithm=algorithm,
+                config=cfg,
+                verbose=True,
+                n_jobs=N_JOBS if backend == "multicore" else None,
+                chunksize=CHUNKSIZE,
+            )
+            corrected = api.run_transform(
+                X,
+                params,
+                backend=backend,
+                algorithm=algorithm,
+                n_jobs=N_JOBS if backend == "multicore" else None,
+            )
+            elapsed = time.perf_counter() - t0
+            corrected_mean = np.mean(corrected, axis=0).astype(np.float32)
 
-        weights = np.asarray(meta.get("last_weights", np.ones(params.shape[0])), dtype=np.float32)
-        image_scores = np.asarray(meta.get("last_image_scores", params[:, 3]), dtype=np.float32)
-        posterior_scores = np.asarray(meta.get("last_posterior_scores", params[:, 3]), dtype=np.float32)
+            summary, gauge = summarize_run(
+                name=run_name,
+                backend=backend,
+                cfg=cfg,
+                algorithm=algorithm,
+                elapsed=elapsed,
+                final_ref=final_ref,
+                corrected=corrected,
+                params=params,
+                meta=meta,
+                gt_img=gt_img,
+                geo=geo,
+                mask=mask,
+            )
+            summary_rows.append(summary)
 
-        if SAVE_OUTPUTS:
-            save_params_csv(outdir / f"{name}_params_weights.csv", params, weights, image_scores, posterior_scores)
-            save_iteration_csv(outdir / f"{name}_iteration_summary.csv", meta)
-            np.save(outdir / f"{name}_final_ref.npy", final_ref)
-            np.save(outdir / f"{name}_corrected_mean.npy", corrected_mean)
+            weights = np.asarray(meta.get("last_weights", np.ones(params.shape[0])), dtype=np.float32)
+            image_scores = np.asarray(meta.get("last_image_scores", params[:, 3]), dtype=np.float32)
+            posterior_scores = np.asarray(meta.get("last_posterior_scores", params[:, 3]), dtype=np.float32)
 
-        results.append({
-            "name": name,
-            "cfg": cfg,
-            "algorithm": algorithm,
-            "final_ref": final_ref,
-            "corrected_mean": corrected_mean,
-            "params": params,
-            "meta": meta,
-            "weights": weights,
-            "image_scores": image_scores,
-            "posterior_scores": posterior_scores,
-            "gauge": gauge,
-        })
+            if SAVE_OUTPUTS:
+                save_params_csv(outdir / f"{run_name}_params_weights.csv", params, weights, image_scores, posterior_scores)
+                save_iteration_csv(outdir / f"{run_name}_iteration_summary.csv", meta)
+                np.save(outdir / f"{run_name}_final_ref.npy", final_ref)
+                np.save(outdir / f"{run_name}_corrected_mean.npy", corrected_mean)
 
-        print(
-            f"{name}: elapsed={elapsed:.2f}s, "
-            f"effective_n={summary['effective_n']:.2f}, "
-            f"weight_mean={summary['weight_mean']:.3f}, "
-            f"shift_mean={summary['shift_mean_px']:.2f}px, "
-            f"large_shift_gt20={summary['large_shift_gt20_count']}, "
-            f"gauge_corr={summary['corrected_mean_gauge_corr']}"
-        )
+            results.append({
+                "name": run_name,
+                "backend": backend,
+                "phase_name": phase_name,
+                "cfg": cfg,
+                "algorithm": algorithm,
+                "final_ref": final_ref,
+                "corrected_mean": corrected_mean,
+                "params": params,
+                "meta": meta,
+                "weights": weights,
+                "image_scores": image_scores,
+                "posterior_scores": posterior_scores,
+                "gauge": gauge,
+            })
+
+            print(
+                f"{run_name}: elapsed={elapsed:.2f}s, "
+                f"effective_n={summary['effective_n']:.2f}, "
+                f"weight_mean={summary['weight_mean']:.3f}, "
+                f"shift_mean={summary['shift_mean_px']:.2f}px, "
+                f"large_shift_gt20={summary['large_shift_gt20_count']}, "
+                f"gauge_corr={summary['corrected_mean_gauge_corr']}"
+            )
 
     summary_df = pd.DataFrame(summary_rows)
     print("\n=== Phase summary ===")
@@ -704,5 +727,11 @@ def run_three_phase_demo():
     }
 
 
-# Running the file in Spyder will execute everything below.
-RUN_OUTPUT = run_three_phase_demo()
+# Running the file directly in Spyder will execute everything below. The guard is
+# important for the multicore backend on spawn-based multiprocessing platforms:
+# worker processes import the main module during bootstrap and must not rerun the
+# full real-data demo recursively.
+if __name__ == "__main__":
+    RUN_OUTPUT = run_three_phase_demo()
+else:
+    RUN_OUTPUT = None
