@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
   "numpy",
   "scipy",
-  "opencv-python",
+  "opencv-python-headless",
 ]
 
 [project.optional-dependencies]
@@ -45,13 +45,8 @@ dev = [
   "pandas",
 ]
 
-[tool.setuptools]
-py-modules = [
-  "alignimg_api",
-  "align_utils",
-  "align_multicore",
-  "align_batch_cpu",
-]
-
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -11,14 +11,9 @@ import alignimg as ai
 import alignimg.api as api
 ```
 
-Legacy root-level imports are still supported while existing scripts migrate:
-
-```python
-import alignimg_api as api
-import align_utils as au
-import align_multicore
-import align_batch_cpu
-```
+Legacy root-level compatibility modules have been removed to keep AlignImg
+lightweight and package-oriented. Import through `alignimg` after installing the
+package or adding `src/` to `PYTHONPATH` during local development.
 
 ## Installation
 
@@ -40,8 +35,14 @@ For real-data examples and plotting:
 python -m pip install -e .[io,plot]
 ```
 
-Core installation depends only on `numpy`, `scipy`, and `opencv-python`.
-`mrcfile`, `matplotlib`, and `pandas` are optional example dependencies.
+Core installation depends only on `numpy`, `scipy`, and `opencv-python-headless`.
+OpenCV is a required runtime dependency for image rotation, shifting, and
+low-pass filtering; installing AlignImg with `python -m pip install -e .` installs
+the headless OpenCV wheel automatically. The headless wheel avoids GUI/system-GL
+requirements and is suitable for servers, notebooks, and downstream projects
+that only need image alignment. You can verify the required OpenCV dependency
+with `python -c "import cv2; print(cv2.__version__)"`. `mrcfile`, `matplotlib`,
+and `pandas` are optional example dependencies.
 
 ## Quick Start
 
