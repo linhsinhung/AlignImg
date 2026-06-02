@@ -1,0 +1,15 @@
+include README.md
+include README_API.md
+include LICENSE
+exclude *.mrc
+exclude *.mrcs
+exclude *.npy
+exclude *.npz
+recursive-exclude __pycache__ *
+recursive-exclude .pytest_cache *
+recursive-exclude *.egg-info *
+recursive-exclude build *
+recursive-exclude dist *
+recursive-exclude realdata_* *
+recursive-exclude accuracy_report* *
+recursive-exclude minimal_report* *

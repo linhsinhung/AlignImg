@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alignimg"
+version = "0.1.0"
+description = "CPU-based robust MAP-EM 2D image alignment with multicore and warm-start refinement support."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Hsin-Hung Lin"}
+]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["image alignment", "cryo-EM", "MAP-EM", "multiprocessing", "scientific computing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "opencv-python",
+]
+
+[project.optional-dependencies]
+io = [
+  "mrcfile",
+]
+plot = [
+  "matplotlib",
+  "pandas",
+]
+dev = [
+  "pytest",
+  "build",
+  "twine",
+  "mrcfile",
+  "matplotlib",
+  "pandas",
+]
+
+[tool.setuptools]
+py-modules = [
+  "alignimg_api",
+  "align_utils",
+  "align_multicore",
+  "align_batch_cpu",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

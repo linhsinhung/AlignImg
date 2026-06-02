@@ -1,3 +1,3 @@
 """Compatibility wrapper for legacy imports."""
 
-from alignimg.api import *
+from alignimg.multicore import *
