@@ -8,14 +8,10 @@ import alignimg as ai
 import alignimg.api as api
 ```
 
-Compatibility wrappers remain at the project root for older scripts:
-
-```python
-import alignimg_api as api
-import align_utils as au
-import align_multicore
-import align_batch_cpu
-```
+AlignImg intentionally exposes only the `alignimg` package namespace. The old
+root-level compatibility modules (`alignimg_api`, `align_utils`,
+`align_multicore`, and `align_batch_cpu`) are no longer packaged; downstream
+projects should install AlignImg and import from `alignimg`.
 
 The current production package files are:
 
@@ -26,6 +22,11 @@ The current production package files are:
 
 Examples live in `examples/`. The standalone prototype lives in `prototypes/`
 and is not part of the public package API.
+
+OpenCV (`cv2`) is required by the alignment primitives and is installed through
+the core `opencv-python-headless` dependency. Downstream projects should verify
+their environment can import OpenCV, for example with
+`python -c "import cv2; print(cv2.__version__)"`.
 
 ## Data Shapes
 

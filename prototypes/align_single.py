@@ -7,21 +7,28 @@ This file intentionally keeps a complete self-contained implementation of
 Phase 1 / Phase 2 / Phase 3 for readability and algorithm development.
 
 Production implementation:
-    align_utils.py
-    alignimg_api.py
+    alignimg.utils
+    alignimg.api
 
-This file should not be imported by alignimg_api.py.
+This file is a prototype and is not imported by the public package.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from pathlib import Path
+import sys
 import time
 from typing import Literal
 
 import numpy as np
 
-import align_utils as au
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from alignimg import utils as au
 
 
 WeightMode = Literal["none", "sigmoid", "hard_quantile"]
