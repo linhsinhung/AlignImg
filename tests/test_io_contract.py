@@ -4,18 +4,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
 import alignimg.api as api
-import alignimg.utils as au
+from alignimg import _utils as au
 
 
 def make_synthetic_stack(n=8, size=64):
@@ -84,7 +76,6 @@ def main():
         num_iterations=num_iterations,
         mask_diameter=56,
         backend="single",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
         search_mode="global",
@@ -109,10 +100,9 @@ def main():
         num_iterations=num_iterations,
         mask_diameter=56,
         backend="single",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
-        previous_params=params,
+        initial_params=params,
         search_mode="refine",
     )
     assert_contract(
@@ -128,6 +118,23 @@ def main():
 
     warm_corrected = api.run_transform(X, warm_params, backend="single")
     assert warm_corrected.shape == X.shape
+
+    try:
+        api.run_alignment(
+            X,
+            final_ref,
+            num_iterations=num_iterations,
+            mask_diameter=56,
+            backend="single",
+            config=cfg,
+            verbose=False,
+            previous_params=params,
+            search_mode="refine",
+        )
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("previous_params should not be accepted")
 
     print("test_io_contract.py: ok")
 

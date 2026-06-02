@@ -25,7 +25,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import alignimg.api as api
-import alignimg.utils as au
+from alignimg import _utils as au
 
 
 def load_mrc_stack(path: Path, n: int) -> np.ndarray | None:
@@ -108,7 +108,6 @@ def run_case(name, X, ref, cfg, num_iterations, n_jobs, chunksize, initial_param
         X,
         ref,
         backend="multicore",
-        algorithm="mapem",
         config=cfg,
         num_iterations=num_iterations,
         initial_params=initial_params,
@@ -117,7 +116,7 @@ def run_case(name, X, ref, cfg, num_iterations, n_jobs, chunksize, initial_param
         chunksize=chunksize,
         verbose=True,
     )
-    corrected = api.run_transform(X, params, backend="multicore", algorithm="mapem", n_jobs=n_jobs)
+    corrected = api.run_transform(X, params, backend="multicore", n_jobs=n_jobs)
     corrected_mean = np.mean(corrected, axis=0).astype(np.float32)
     elapsed = time.perf_counter() - t0
     return {

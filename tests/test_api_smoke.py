@@ -4,18 +4,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
 import alignimg.api as api
-import alignimg.utils as au
+from alignimg import _utils as au
 
 
 def make_synthetic_stack(n=8, size=64):
@@ -74,6 +66,7 @@ def main():
     X, initial_ref = make_synthetic_stack(n=n, size=size)
 
     backends = api.available_backends()
+    assert set(backends) == {"single", "multicore"}
     assert backends["single"]["implemented"] is True
     assert backends["multicore"]["implemented"] is True
 
@@ -85,7 +78,6 @@ def main():
         num_iterations=1,
         mask_diameter=56,
         backend="single",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
     )
@@ -97,7 +89,6 @@ def main():
         num_iterations=1,
         mask_diameter=56,
         backend="multicore",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
         n_jobs=2,
@@ -112,7 +103,6 @@ def main():
         num_iterations=1,
         mask_diameter=56,
         backend="multicore",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
         n_jobs=2,
@@ -130,12 +120,11 @@ def main():
         num_iterations=1,
         mask_diameter=56,
         backend="multicore",
-        algorithm="mapem",
         config=cfg,
         verbose=False,
         n_jobs=2,
         chunksize=1,
-        previous_params=params_multi,
+        initial_params=params_multi,
         search_mode="refine",
     )
     assert_alignment_output(final_ref_warm, history_warm, params_warm, meta_warm, n, size)
@@ -152,13 +141,26 @@ def main():
         num_iterations=1,
         mask_diameter=56,
         backend="single",
-        algorithm="mapem",
         config=batched_cfg,
         verbose=False,
-        previous_params=params_single[:, :3],
+        initial_params=params_single[:, :3],
         search_mode="refine",
     )
     assert_alignment_output(final_ref_batched, history_batched, params_batched, meta_batched, n, size)
+
+    try:
+        api.run_alignment(X, initial_ref, backend="gpu", config=cfg, verbose=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("gpu backend should not be accepted")
+
+    try:
+        api.run_alignment(X, initial_ref, algorithm="mapem")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("algorithm should not be accepted")
 
     print("test_api_smoke.py: ok")
 
