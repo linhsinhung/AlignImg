@@ -29,7 +29,7 @@ def _unique_normalized_angles(angles) -> list[float]:
 def scan_joint_angles_batched_cpu(img, ref, geo, angles, mask=None):
     """Evaluate one image against many angle candidates using batched FFT.
 
-    The returned candidate dictionaries match align_utils.scan_joint_angles().
+    The returned candidate dictionaries match alignimg.utils.scan_joint_angles().
     Rotation still uses OpenCV one angle at a time; the experimental speedup is
     limited to batched translation FFTs and shared candidate bookkeeping.
     """
