@@ -1,15 +1,27 @@
 include README.md
 include README_API.md
 include LICENSE
-exclude *.mrc
-exclude *.mrcs
-exclude *.npy
-exclude *.npz
-recursive-exclude __pycache__ *
-recursive-exclude .pytest_cache *
-recursive-exclude *.egg-info *
-recursive-exclude build *
-recursive-exclude dist *
-recursive-exclude realdata_* *
-recursive-exclude accuracy_report* *
-recursive-exclude minimal_report* *
+include pyproject.toml
+
+recursive-include src *.py
+recursive-include tests *.py
+recursive-include examples *.py
+recursive-include prototypes *.py
+
+prune .pytest_cache
+prune build
+prune dist
+prune *.egg-info
+prune examples/realdata_*
+prune __pycache__
+recursive-exclude * __pycache__
+recursive-exclude * *.egg-info
+
+global-exclude .DS_Store
+global-exclude *.py[cod]
+global-exclude *.mrc
+global-exclude *.mrcs
+global-exclude *.npy
+global-exclude *.npz
+global-exclude *.csv
+global-exclude *.png

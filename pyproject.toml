@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alignimg"
-version = "0.1.0"
+version = "0.2.0"
 description = "CPU-based robust MAP-EM 2D image alignment with multicore and warm-start refinement support."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,8 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
@@ -39,6 +41,7 @@ plot = [
 dev = [
   "pytest",
   "build",
+  "wheel",
   "twine",
   "mrcfile",
   "matplotlib",
@@ -50,3 +53,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

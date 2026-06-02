@@ -1,19 +1,26 @@
 # AlignImg
 
-AlignImg is a CPU-based 2D image alignment package for robust MAP-EM workflows.
-It includes single-process and multicore backends, optional warm-start
-refinement, and an experimental batched CPU local scan path.
+AlignImg is a CPU-based 2D image alignment package for robust MAP-EM
+workflows. It provides a small public API, single-process and multicore CPU
+backends, warm-start refinement, and an experimental batched local scan option.
 
-The public package API is available as:
+Use the package namespace:
 
 ```python
 import alignimg as ai
-import alignimg.api as api
 ```
 
-Legacy root-level compatibility modules have been removed to keep AlignImg
-lightweight and package-oriented. Import through `alignimg` after installing the
-package or adding `src/` to `PYTHONPATH` during local development.
+The supported public API is:
+
+```python
+ai.MAPEMConfig
+ai.available_backends()
+ai.make_mapem_config()
+ai.run_alignment()
+ai.run_transform()
+```
+
+Implementation modules with underscore names are internal and may change.
 
 ## Installation
 
@@ -35,19 +42,12 @@ For real-data examples and plotting:
 python -m pip install -e .[io,plot]
 ```
 
-Core installation depends only on `numpy`, `scipy`, and `opencv-python-headless`.
-OpenCV is a required runtime dependency for image rotation, shifting, and
-low-pass filtering; installing AlignImg with `python -m pip install -e .` installs
-the headless OpenCV wheel automatically. The headless wheel avoids GUI/system-GL
-requirements and is suitable for servers, notebooks, and downstream projects
-that only need image alignment. You can verify the required OpenCV dependency
-with `python -c "import cv2; print(cv2.__version__)"`. `mrcfile`, `matplotlib`,
-and `pandas` are optional example dependencies.
+Core installation depends on `numpy`, `scipy`, and `opencv-python-headless`.
+`mrcfile`, `matplotlib`, and `pandas` are optional example dependencies.
 
 ## Quick Start
 
 ```python
-import numpy as np
 import alignimg as ai
 
 cfg = ai.make_mapem_config(
@@ -63,48 +63,21 @@ final_ref, history, params, meta = ai.run_alignment(
     num_iterations=4,
     mask_diameter=80.0,
     backend="multicore",
-    algorithm="mapem",
     config=cfg,
     n_jobs=24,
 )
 
-corrected = ai.run_transform(X, params)
+corrected = ai.run_transform(X, params, backend="multicore", n_jobs=24)
 ```
 
-`X` is an image stack with shape `(N, H, W)`. `initial_ref` is a reference image
-with shape `(H, W)`. Output `params` uses the stable convention
+`X` is an image stack with shape `(N, H, W)`. `initial_ref` is a reference
+image with shape `(H, W)`. Output `params` uses the stable convention
 `[angle, dy, dx, score]`.
 
-## Cold-Start Alignment
+## Warm-Start Refinement
 
-Cold start uses the global search schedule:
-
-```python
-cfg = ai.make_mapem_config(
-    phase=3,
-    weight_mode="sigmoid",
-    lambda_shift=0.01,
-    lambda_angle=0.0,
-)
-
-final_ref, history, params, meta = ai.run_alignment(
-    X,
-    initial_ref,
-    num_iterations=4,
-    mask_diameter=80.0,
-    backend="multicore",
-    algorithm="mapem",
-    config=cfg,
-    search_mode="global",
-    n_jobs=24,
-)
-```
-
-## Warm-Start Refine
-
-Warm-start refinement reuses parameters from a previous call and runs local
-refinement. This path is preserved and remains opt-in through the warm-start
-parameters and `search_mode="refine"`.
+Warm-start refinement reuses pose parameters from a previous call and runs a
+local search:
 
 ```python
 final_ref2, history2, params2, meta2 = ai.run_alignment(
@@ -113,42 +86,40 @@ final_ref2, history2, params2, meta2 = ai.run_alignment(
     num_iterations=1,
     mask_diameter=80.0,
     backend="multicore",
-    algorithm="mapem",
     config=cfg,
-    previous_params=params,
+    initial_params=params,
     search_mode="refine",
     n_jobs=24,
     use_shared_memory=True,
 )
 ```
 
-Warm-start inputs may be passed as `previous_params`, `initial_params`, or
-`warm_start_params`. Use only one of these in a single call.
+`initial_params` is the only warm-start argument. It accepts `(N, 3)` or
+`(N, 4+)` arrays with columns `[angle, dy, dx, score optional]`.
 
-## Shared Memory
+## Backends
 
-`use_shared_memory=True` is an optional multicore MAP-EM mode for large
-workloads. It shares input arrays between worker processes to reduce copy
-overhead. It defaults to `False` and does not change the transform convention,
-parameter format, or algorithm objective.
+Implemented backends:
+
+- `single`: single-process CPU MAP-EM
+- `multicore`: process-parallel CPU MAP-EM
+
+`use_shared_memory=True` is an optional multicore mode for large workloads. It
+does not change the transform convention, parameter format, or MAP-EM objective.
 
 ## Experimental Batched Scan
 
-`use_batched_scan=True` enables an experimental CPU batched local angle scan.
-It is not the default and is intended for explicit benchmarking or local
-refinement experiments:
+`use_batched_scan=True` enables an experimental CPU batched local angle scan. It
+is off by default and intended for benchmarking or local refinement experiments:
 
 ```python
 cfg = ai.make_mapem_config(use_batched_scan=True)
 ```
 
-## Current Limitations
+## Data And Outputs
 
-- The implemented backends are CPU-only: `single` and `multicore`.
-- The `gpu` backend is reserved for future implementation.
-- No PyTorch or CuPy dependency is included.
-- Large MRC/MRCS/NPY/NPZ data files are not part of the package.
-- Example scripts may require optional `io` and `plot` dependencies.
+Large MRC/MRCS/NPY/NPZ data files and generated real-data outputs are local
+artifacts. They are ignored by Git and excluded from package builds.
 
 ## Testing
 
@@ -158,15 +129,7 @@ Run the pytest suite:
 python -m pytest tests
 ```
 
-The script-style tests also support direct execution:
-
-```bash
-python tests/test_api_smoke.py
-python tests/test_io_contract.py
-python tests/test_batch_scan_cpu.py
-```
-
-Optional benchmark smoke check:
+Run the optimization benchmark smoke check:
 
 ```bash
 python examples/benchmark_cpu_optimization.py --n 64 --n-jobs 2 --refine-iters 1

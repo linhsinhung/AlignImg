@@ -11,10 +11,10 @@ and shows figures interactively.
 This v3 script does NOT import align_single_v2.py.  It tests the formal
 package path:
 
-    alignimg.api  ->  alignimg.utils
+    alignimg.api
 
 Expected API support:
-    api.run_alignment(..., algorithm="mapem", config=api.make_mapem_config(...))
+    api.run_alignment(..., config=api.make_mapem_config(...))
     api.run_transform(...)
 
 Edit the CONFIG block before running.
@@ -41,15 +41,15 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import alignimg.api as api
-import alignimg.utils as au
+from alignimg import _utils as au
 
 
 # =============================================================================
 # CONFIG: edit these values in Spyder before running
 # =============================================================================
 
-DATA_PATH = "./test_align.mrcs"
-GT_PATH = "./mu_aligned_mean.mrc"     # optional; set to None or "" if unavailable
+DATA_PATH = "../test_align.mrcs"
+GT_PATH = "../mu_aligned_mean.mrc"     # optional; set to None or "" if unavailable
 OUTPUT_DIR = "realdata_Multi"
 
 # Data subset. Set N_PARTICLES = 0 to load all particles.
@@ -65,7 +65,7 @@ MASK_DIAMETER = 80.0
 # MAP-EM backend to the same phase/configuration sweep.
 BACKENDS = ["single", "multicore"]
 
-# Multicore backend controls. N_JOBS = None lets alignimg.multicore choose
+# Multicore backend controls. N_JOBS = None lets the multicore backend choose
 # min(os.cpu_count(), num_particles). Keep CHUNKSIZE conservative for the
 # first correctness-focused multicore backend.
 N_JOBS = 2
@@ -97,7 +97,7 @@ FINE_STEP = 0.5
 TOPK = 3
 
 # Experimental CPU batch mode. Disabled by default; when True, MAP-EM local
-# angle scans use alignimg.batch_cpu.scan_joint_angles_batched_cpu().
+# angle scans use the internal batched CPU scan helper.
 USE_BATCHED_SCAN = False
 
 # Reference update / diagnostics
@@ -250,17 +250,7 @@ def make_api_mapem_config(phase: int, weight_mode: str, *, lambda_shift: float =
         diagnostics_n=DIAGNOSTICS_N,
     )
 
-    if hasattr(api, "make_mapem_config"):
-        return api.make_mapem_config(**common)
-
-    # Fallback for direct alignimg.utils use if an older API lacks make_mapem_config.
-    if hasattr(au, "MAPEMConfig"):
-        return au.MAPEMConfig(**common)
-
-    raise RuntimeError(
-        "This script requires the updated API with make_mapem_config(), "
-        "or alignimg.utils.MAPEMConfig."
-    )
+    return api.make_mapem_config(**common)
 
 
 def config_to_dict(cfg) -> dict:
@@ -275,15 +265,12 @@ def make_phase_configs() -> Dict[str, dict]:
     """Return phase configurations to run through alignimg.api."""
     return {
         "phase1_hard_map": {
-            "algorithm": "mapem",
             "config": make_api_mapem_config(phase=1, weight_mode="none"),
         },
         "phase2_robust_sigmoid": {
-            "algorithm": "mapem",
             "config": make_api_mapem_config(phase=2, weight_mode="sigmoid"),
         },
         "phase3_translation_prior": {
-            "algorithm": "mapem",
             "config": make_api_mapem_config(
                 phase=3,
                 weight_mode="sigmoid",
@@ -352,7 +339,6 @@ def summarize_run(
     name: str,
     backend: str,
     cfg,
-    algorithm: str,
     elapsed: float,
     final_ref: np.ndarray,
     corrected: np.ndarray,
@@ -377,7 +363,6 @@ def summarize_run(
     row = {
         "method": name,
         "backend": backend,
-        "algorithm": algorithm,
         "search_mode": meta.get("search_mode", ""),
         "has_initial_params": bool(meta.get("has_initial_params", False)),
         "phase": cfg_dict.get("phase", np.nan),
@@ -617,10 +602,9 @@ def run_three_phase_demo():
     for backend in backends:
         for phase_name, spec in configs.items():
             cfg = spec["config"]
-            algorithm = spec.get("algorithm", "mapem")
             run_name = f"{backend}_{phase_name}"
             print(f"\n=== Running {run_name} through alignimg.api ===")
-            print(f"algorithm={algorithm}, backend={backend}")
+            print(f"backend={backend}")
             if backend == "multicore":
                 print(f"multicore controls: n_jobs={N_JOBS}, chunksize={CHUNKSIZE}")
             print(f"config: {config_to_dict(cfg)}")
@@ -632,7 +616,6 @@ def run_three_phase_demo():
                 num_iterations=NUM_ITERATIONS,
                 mask_diameter=MASK_DIAMETER,
                 backend=backend,
-                algorithm=algorithm,
                 config=cfg,
                 verbose=True,
                 n_jobs=N_JOBS if backend == "multicore" else None,
@@ -642,7 +625,6 @@ def run_three_phase_demo():
                 X,
                 params,
                 backend=backend,
-                algorithm=algorithm,
                 n_jobs=N_JOBS if backend == "multicore" else None,
             )
             elapsed = time.perf_counter() - t0
@@ -652,7 +634,6 @@ def run_three_phase_demo():
                 name=run_name,
                 backend=backend,
                 cfg=cfg,
-                algorithm=algorithm,
                 elapsed=elapsed,
                 final_ref=final_ref,
                 corrected=corrected,
@@ -679,7 +660,6 @@ def run_three_phase_demo():
                 "backend": backend,
                 "phase_name": phase_name,
                 "cfg": cfg,
-                "algorithm": algorithm,
                 "final_ref": final_ref,
                 "corrected_mean": corrected_mean,
                 "params": params,
@@ -734,7 +714,6 @@ def run_three_phase_demo():
                 num_iterations=WARM_START_ITERATIONS,
                 mask_diameter=MASK_DIAMETER,
                 backend=WARM_START_BACKEND,
-                algorithm="mapem",
                 config=warm_cfg,
                 initial_params=source["params"],
                 search_mode=WARM_START_SEARCH_MODE,
@@ -747,7 +726,6 @@ def run_three_phase_demo():
                 X,
                 params_ws,
                 backend=WARM_START_BACKEND,
-                algorithm="mapem",
                 n_jobs=WARM_START_N_JOBS,
             )
 
@@ -758,7 +736,6 @@ def run_three_phase_demo():
                 name="warmstart_phase3_refine",
                 backend=WARM_START_BACKEND,
                 cfg=warm_cfg,
-                algorithm="mapem",
                 elapsed=elapsed_ws,
                 final_ref=final_ref_ws,
                 corrected=corrected_ws,
@@ -795,7 +772,6 @@ def run_three_phase_demo():
                 "backend": WARM_START_BACKEND,
                 "phase_name": "warmstart_phase3_refine",
                 "cfg": warm_cfg,
-                "algorithm": "mapem",
                 "final_ref": final_ref_ws,
                 "corrected_mean": corrected_mean_ws,
                 "params": params_ws,

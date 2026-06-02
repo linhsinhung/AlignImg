@@ -7,7 +7,6 @@ This file intentionally keeps a complete self-contained implementation of
 Phase 1 / Phase 2 / Phase 3 for readability and algorithm development.
 
 Production implementation:
-    alignimg.utils
     alignimg.api
 
 This file is a prototype and is not imported by the public package.
@@ -28,7 +27,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from alignimg import utils as au
+from alignimg import _utils as au
 
 
 WeightMode = Literal["none", "sigmoid", "hard_quantile"]
@@ -296,7 +295,7 @@ def run_alignment_mapem(
 
     meta = {
         "backend": "single-v2-mapem",
-        "engine": "align-single-v2-mapem",
+        "engine": "alignimg-prototype-mapem-single",
         "config": asdict(cfg),
         "iterations": [],
         "num_particles": n,

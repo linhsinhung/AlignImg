@@ -1,122 +1,73 @@
 # AlignImg Public API
 
-This document describes the current public API exposed by the `alignimg`
-package. Prefer the package imports:
+This document describes the public API for AlignImg 0.2.0. Prefer the package
+namespace:
 
 ```python
 import alignimg as ai
-import alignimg.api as api
 ```
 
-AlignImg intentionally exposes only the `alignimg` package namespace. The old
-root-level compatibility modules (`alignimg_api`, `align_utils`,
-`align_multicore`, and `align_batch_cpu`) are no longer packaged; downstream
-projects should install AlignImg and import from `alignimg`.
+Supported public names:
 
-The current production package files are:
+```python
+ai.__version__
+ai.MAPEMConfig
+ai.available_backends()
+ai.make_mapem_config()
+ai.run_alignment()
+ai.run_transform()
+```
 
-- `src/alignimg/utils.py`: CPU primitives and single-process CPU backends
-- `src/alignimg/multicore.py`: multi-core CPU MAP-EM backend
-- `src/alignimg/api.py`: public interface and backend dispatcher
-- `src/alignimg/batch_cpu.py`: experimental batched CPU local scan helper
-
-Examples live in `examples/`. The standalone prototype lives in `prototypes/`
-and is not part of the public package API.
-
-OpenCV (`cv2`) is required by the alignment primitives and is installed through
-the core `opencv-python-headless` dependency. Downstream projects should verify
-their environment can import OpenCV, for example with
-`python -c "import cv2; print(cv2.__version__)"`.
+Underscore-prefixed modules are internal implementation details.
 
 ## Data Shapes
 
-### Image Stack `X`
-
-Input particle/image stack:
+Image stack `X`:
 
 ```text
 (N, H, W)
 ```
 
-`float32` is preferred.
-
-### Initial Reference `initial_ref`
-
-Input reference image:
+Initial reference `initial_ref`:
 
 ```text
 (H, W)
 ```
 
-`float32` is preferred.
-
-### Alignment Parameters `params`
-
-Canonical output alignment parameters:
+Alignment parameters `params`:
 
 ```text
 (N, 4)
-```
-
-Columns:
-
-```text
 [angle, dy, dx, score]
 ```
 
-For MAP-EM output, the fourth column is the posterior score:
+For MAP-EM output, `score` is the posterior score.
 
-```text
-[angle, dy, dx, posterior_score]
-```
-
-### Warm-Start Parameters
-
-The warm-start arguments are aliases for the same input contract:
-
-- `previous_params`
-- `initial_params`
-- `warm_start_params`
-
-Accepted shapes:
+Warm-start `initial_params` accepts:
 
 ```text
 (N, 3)
-(N, 4)
+(N, 4+)
 ```
 
-Columns:
-
-```text
-[angle, dy, dx, score optional]
-```
-
-Only one warm-start argument should be provided in a single call.
+Columns are `[angle, dy, dx, score optional]`.
 
 ## `ai.available_backends()`
 
-Return backend metadata as a dictionary.
+Return implemented backend metadata.
 
 ```python
 backends = ai.available_backends()
 ```
 
-Currently implemented production backends:
+Implemented backends:
 
 - `single`
 - `multicore`
 
-The `gpu` backend is reserved for future implementation.
-
 ## `ai.make_mapem_config()`
 
-Create a MAP-EM configuration object with the current package defaults.
-
-```python
-cfg = ai.make_mapem_config()
-```
-
-Common options include:
+Create a MAP-EM configuration object.
 
 ```python
 cfg = ai.make_mapem_config(
@@ -130,21 +81,30 @@ cfg = ai.make_mapem_config(
 )
 ```
 
-`use_batched_scan=True` is experimental and defaults to `False`. It only
-affects local MAP-EM angle scans when explicitly enabled.
+`phase` controls the MAP-EM variant:
+
+- `1`: hard-MAP pose inference with unweighted template update
+- `2`: robust MAP-EM with inlier weights
+- `3`: robust MAP-EM with pose priors
+
+`use_batched_scan=True` is experimental and off by default. It only affects
+local MAP-EM angle scans.
 
 ## `ai.run_alignment()`
 
-Run alignment through the public backend dispatcher.
+Run MAP-EM alignment through a CPU backend.
 
 ```python
 final_ref, history, params, meta = ai.run_alignment(
     X,
     initial_ref,
     num_iterations=4,
+    mask_diameter=80.0,
     backend="multicore",
-    algorithm="mapem",
     config=cfg,
+    initial_params=None,
+    search_mode="global",
+    n_jobs=24,
 )
 ```
 
@@ -154,27 +114,19 @@ Inputs:
 - `initial_ref`: `(H, W)`, `float32` preferred
 - `num_iterations`: number of MAP-EM iterations
 - `backend`: `"single"` or `"multicore"`
-- `algorithm`: `"mapem"` for the recommended robust MAP-EM path
-- `config`: optional `MAPEMConfig` from `ai.make_mapem_config()`
-- `use_shared_memory`: optional `False`/`True` flag for the multicore MAP-EM backend
+- `config`: optional `MAPEMConfig`; defaults to `ai.make_mapem_config()`
+- `initial_params`: optional warm-start poses
+- `search_mode`: `"auto"`, `"global"`, or `"refine"`
+- `use_shared_memory`: optional multicore data-transfer mode
 
 Returns:
 
 - `final_ref`: `(H, W)`
 - `history`: list of `(H, W)` references, including the initial masked reference
 - `params`: `(N, 4)`, columns `[angle, dy, dx, posterior_score]`
-- `meta`: dictionary containing at least:
-  - `last_weights`: `(N,)`
-  - `last_image_scores`: `(N,)`
-  - `last_posterior_scores`: `(N,)`
+- `meta`: backend, config, search mode, warm-start status, timing, scores, weights
 
-The metadata also includes backend, algorithm, search mode, warm-start status,
-configuration, timing, and per-iteration summaries.
-
-`use_shared_memory=True` is an opt-in multicore MAP-EM mode that shares the
-input stack and per-iteration matching reference between worker processes. It
-only affects internal multicore data transfer and does not change the alignment
-objective, transform convention, output format, or returned values.
+`search_mode="refine"` requires `initial_params`.
 
 ## `ai.run_transform()`
 
@@ -184,57 +136,24 @@ Apply final transform parameters to an image stack.
 corrected = ai.run_transform(
     X,
     params,
-    backend="single",
+    backend="multicore",
+    n_jobs=24,
 )
 ```
 
 Inputs:
 
 - `X`: `(N, H, W)`, `float32` preferred
-- `params`: `(N, 4)` or compatible parameter array using columns `[angle, dy, dx, score]`
+- `params`: `(N, 4)` or compatible array using columns `[angle, dy, dx, score]`
+- `backend`: `"single"` or `"multicore"`
 
 Returns:
 
 - `corrected`: `(N, H, W)`
 
-## Recommended Usage
+## Real-Data Examples
 
-### Cold Start
-
-Use a global search over several iterations:
-
-```python
-cfg = ai.make_mapem_config()
-
-final_ref, history, params, meta = ai.run_alignment(
-    X,
-    initial_ref,
-    backend="multicore",
-    algorithm="mapem",
-    search_mode="global",
-    num_iterations=4,
-    config=cfg,
-)
-```
-
-### Warm-Start / Repeated Call
-
-Reuse parameters from a previous call and run local refinement:
-
-```python
-cfg = ai.make_mapem_config()
-
-final_ref, history, params, meta = ai.run_alignment(
-    X,
-    initial_ref,
-    backend="multicore",
-    algorithm="mapem",
-    previous_params=params_prev,
-    search_mode="refine",
-    num_iterations=1,
-    config=cfg,
-)
-```
-
-Warm-start refinement accepts `previous_params`, `initial_params`, or
-`warm_start_params`; pass only one of them per call.
+`examples/test_realdata.py` is a Spyder/server-friendly script for real-data
+experiments. It writes CSV, PNG, and NPY outputs to `examples/realdata_Multi/`.
+Those generated outputs, along with large MRC/MRCS/NPY/NPZ data files, are local
+artifacts and are excluded from package builds.

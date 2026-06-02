@@ -4,18 +4,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-import alignimg.batch_cpu as batch
-import alignimg.utils as au
+from alignimg import _batch_cpu as batch
+from alignimg import _utils as au
 
 
 def make_synthetic_pair(size=64):
