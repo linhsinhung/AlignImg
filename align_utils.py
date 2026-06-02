@@ -386,6 +386,45 @@ def mapem_iter_schedule(it: int, num_iterations: int) -> dict:
     return {"mode": "local", "angle_range": 2.0, "angle_step": 0.5, "lp_sigma": 0.0}
 
 
+# def mapem_warm_start_iter_schedule(it: int, num_iterations: int) -> dict:
+#     """Annealed local-only schedule for pose warm starts."""
+#     if it == 0:
+#         return {"mode": "local", "angle_range": 8.0, "angle_step": 2.0, "lp_sigma": 1.0}
+#     if it == 1:
+#         return {"mode": "local", "angle_range": 4.0, "angle_step": 1.0, "lp_sigma": 0.0}
+#     return {"mode": "local", "angle_range": 2.0, "angle_step": 0.5, "lp_sigma": 0.0}
+def mapem_warm_start_iter_schedule(it: int, num_iterations: int) -> dict:
+    """Conservative local-only schedule for pose warm starts.
+
+    Used when previous alignment parameters are available.
+    This skips the global search and performs only small local refinements.
+    """
+    if it == 0:
+        return {"mode": "local", "angle_range": 4.0, "angle_step": 1.0, "lp_sigma": 0.0}
+    return {"mode": "local", "angle_range": 2.0, "angle_step": 0.5, "lp_sigma": 0.0}
+
+def initialize_mapem_params(initial_params, n: int) -> tuple[np.ndarray, bool]:
+    """Return canonical MAP-EM params and whether they came from a warm start."""
+    params = np.zeros((int(n), 4), dtype=np.float32)
+    if initial_params is None:
+        return params, False
+
+    seed = np.asarray(initial_params, dtype=np.float32)
+    if seed.ndim != 2 or seed.shape[0] != int(n) or seed.shape[1] < 3:
+        raise ValueError(
+            "initial_params must have shape (N, 3) or (N, 4+); "
+            f"got {seed.shape} for N={int(n)}"
+        )
+    if not np.all(np.isfinite(seed[:, :3])):
+        raise ValueError("initial_params angle/dy/dx values must all be finite.")
+
+    params[:, :3] = seed[:, :3]
+    params[:, 0] = np.asarray([normalize_angle(a) for a in params[:, 0]], dtype=np.float32)
+    if seed.shape[1] >= 4:
+        params[:, 3] = seed[:, 3]
+    return params, True
+
+
 def pose_prior_scores(candidate: dict, prev_angle: float | None, schedule: dict, cfg: MAPEMConfig) -> tuple[float, float]:
     """Return (translation_prior_score, angle_prior_score)."""
     if cfg.phase < 3:
@@ -574,6 +613,8 @@ def run_alignment_mapem_cpu(
     mask_diameter=None,
     config: MAPEMConfig | None = None,
     verbose: bool = True,
+    initial_params=None,
+    search_mode: str | None = None,
 ):
     """Run robust MAP-EM CPU alignment.
 
@@ -595,7 +636,17 @@ def run_alignment_mapem_cpu(
     geo = get_geometry_context(X.shape)
     mask = geo.get_circular_mask(diameter=mask_diameter, soft_edge=cfg.mask_soft_edge)
 
-    params = np.zeros((n, 4), dtype=np.float32)
+    params, has_initial_params = initialize_mapem_params(initial_params, n)
+    requested_search_mode = "auto" if search_mode is None else str(search_mode).strip().lower()
+    if requested_search_mode not in {"auto", "global", "refine"}:
+        raise ValueError("search_mode must be 'auto', 'global', or 'refine'.")
+    if requested_search_mode == "refine" and not has_initial_params:
+        raise ValueError("search_mode='refine' requires initial_params.")
+    use_refine_schedule = requested_search_mode == "refine" or (
+        requested_search_mode == "auto" and has_initial_params
+    )
+    resolved_search_mode = "refine" if use_refine_schedule else "global"
+
     current_ref = apply_circular_mask(initial_ref, geo, diameter=mask_diameter, soft_edge=cfg.mask_soft_edge)
     history_refs = [current_ref.copy()]
 
@@ -608,6 +659,9 @@ def run_alignment_mapem_cpu(
         "num_particles": n,
         "num_iterations": int(num_iterations),
         "mask_diameter": mask_diameter,
+        "has_initial_params": bool(has_initial_params),
+        "search_mode": resolved_search_mode,
+        "warm_start": bool(use_refine_schedule),
         "implemented": True,
     }
 
@@ -616,7 +670,10 @@ def run_alignment_mapem_cpu(
     posterior_scores = np.zeros(n, dtype=np.float32)
 
     for it in range(int(num_iterations)):
-        schedule = mapem_iter_schedule(it, int(num_iterations))
+        if use_refine_schedule:
+            schedule = mapem_warm_start_iter_schedule(it, int(num_iterations))
+        else:
+            schedule = mapem_iter_schedule(it, int(num_iterations))
         if verbose:
             print(
                 f"[MAP-EM iter {it + 1}/{num_iterations}] "

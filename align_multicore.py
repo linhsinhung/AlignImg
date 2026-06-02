@@ -72,6 +72,8 @@ def run_alignment_mapem_multicore(
     verbose=True,
     n_jobs=None,
     chunksize=1,
+    initial_params=None,
+    search_mode=None,
 ):
     """Run robust MAP-EM alignment with a process-parallel E-step."""
     cfg = (config or au.MAPEMConfig()).normalized()
@@ -88,7 +90,17 @@ def run_alignment_mapem_multicore(
     # Build once in the parent to mirror the single backend's mask construction.
     geo.get_circular_mask(diameter=mask_diameter, soft_edge=cfg.mask_soft_edge)
 
-    params = np.zeros((n, 4), dtype=np.float32)
+    params, has_initial_params = au.initialize_mapem_params(initial_params, n)
+    requested_search_mode = "auto" if search_mode is None else str(search_mode).strip().lower()
+    if requested_search_mode not in {"auto", "global", "refine"}:
+        raise ValueError("search_mode must be 'auto', 'global', or 'refine'.")
+    if requested_search_mode == "refine" and not has_initial_params:
+        raise ValueError("search_mode='refine' requires initial_params.")
+    use_refine_schedule = requested_search_mode == "refine" or (
+        requested_search_mode == "auto" and has_initial_params
+    )
+    resolved_search_mode = "refine" if use_refine_schedule else "global"
+
     current_ref = au.apply_circular_mask(
         initial_ref,
         geo,
@@ -114,6 +126,9 @@ def run_alignment_mapem_multicore(
         "mask_diameter": mask_diameter,
         "n_jobs": n_jobs,
         "chunksize": chunksize,
+        "has_initial_params": bool(has_initial_params),
+        "search_mode": resolved_search_mode,
+        "warm_start": bool(use_refine_schedule),
         "implemented": True,
     }
 
@@ -122,7 +137,10 @@ def run_alignment_mapem_multicore(
     posterior_scores = np.zeros(n, dtype=np.float32)
 
     for it in range(int(num_iterations)):
-        schedule = au.mapem_iter_schedule(it, int(num_iterations))
+        if use_refine_schedule:
+            schedule = au.mapem_warm_start_iter_schedule(it, int(num_iterations))
+        else:
+            schedule = au.mapem_iter_schedule(it, int(num_iterations))
         if verbose:
             print(
                 f"[multicore iter {it + 1}/{num_iterations}] "

@@ -44,10 +44,10 @@ import alignimg_api as api
 
 DATA_PATH = "./test_align.mrcs"
 GT_PATH = "./mu_aligned_mean.mrc"     # optional; set to None or "" if unavailable
-OUTPUT_DIR = "realdata_v3_spyder_report"
+OUTPUT_DIR = "realdata_Multi"
 
 # Data subset. Set N_PARTICLES = 0 to load all particles.
-N_PARTICLES = 500
+N_PARTICLES = 1000
 START_INDEX = 0
 
 # Alignment settings
@@ -62,7 +62,7 @@ BACKENDS = ["single", "multicore"]
 # Multicore backend controls. N_JOBS = None lets align_multicore choose
 # min(os.cpu_count(), num_particles). Keep CHUNKSIZE conservative for the
 # first correctness-focused multicore backend.
-N_JOBS = 4
+N_JOBS = 2
 CHUNKSIZE = 1
 
 # Optional GT display/evaluation correction
@@ -98,6 +98,16 @@ MASK_SOFT_EDGE = 5
 # Output behavior
 SAVE_OUTPUTS = True
 SHOW_FIGURES = True
+
+
+# Warm-start refinement demo
+RUN_WARM_START_DEMO = True
+WARM_START_SOURCE_METHOD = "multicore_phase3_translation_prior"
+WARM_START_BACKEND = "multicore"
+WARM_START_ITERATIONS = 2
+WARM_START_SEARCH_MODE = "refine"
+WARM_START_N_JOBS = N_JOBS or 24
+WARM_START_CHUNKSIZE = 1
 
 
 # =============================================================================
@@ -357,6 +367,8 @@ def summarize_run(
         "method": name,
         "backend": backend,
         "algorithm": algorithm,
+        "search_mode": meta.get("search_mode", ""),
+        "has_initial_params": bool(meta.get("has_initial_params", False)),
         "phase": cfg_dict.get("phase", np.nan),
         "weight_mode": cfg_dict.get("weight_mode", ""),
         "elapsed_s": elapsed,
@@ -675,7 +687,133 @@ def run_three_phase_demo():
                 f"large_shift_gt20={summary['large_shift_gt20_count']}, "
                 f"gauge_corr={summary['corrected_mean_gauge_corr']}"
             )
+    
+    # -------------------------------------------------------------------------
+    # Optional warm-start refinement demo
+    # -------------------------------------------------------------------------
+    if RUN_WARM_START_DEMO:
+        print("\n=== Running warm-start refinement demo ===")
 
+        source = None
+        for res in results:
+            if res["name"] == WARM_START_SOURCE_METHOD:
+                source = res
+                break
+
+        if source is None:
+            print(f"[warm-start] source method not found: {WARM_START_SOURCE_METHOD}")
+        else:
+            warm_cfg = make_api_mapem_config(
+                phase=3,
+                weight_mode="sigmoid",
+                lambda_shift=LAMBDA_SHIFT,
+                lambda_angle=LAMBDA_ANGLE,
+            )
+
+            print(f"[warm-start] source method: {WARM_START_SOURCE_METHOD}")
+            print(f"[warm-start] backend: {WARM_START_BACKEND}")
+            print(f"[warm-start] iterations: {WARM_START_ITERATIONS}")
+            print(f"[warm-start] search_mode: {WARM_START_SEARCH_MODE}")
+
+            t0 = time.perf_counter()
+
+            final_ref_ws, history_ws, params_ws, meta_ws = api.run_alignment(
+                X,
+                source["final_ref"],
+                num_iterations=WARM_START_ITERATIONS,
+                mask_diameter=MASK_DIAMETER,
+                backend=WARM_START_BACKEND,
+                algorithm="mapem",
+                config=warm_cfg,
+                initial_params=source["params"],
+                search_mode=WARM_START_SEARCH_MODE,
+                n_jobs=WARM_START_N_JOBS,
+                chunksize=WARM_START_CHUNKSIZE,
+                verbose=True,
+            )
+
+            corrected_ws = api.run_transform(
+                X,
+                params_ws,
+                backend=WARM_START_BACKEND,
+                algorithm="mapem",
+                n_jobs=WARM_START_N_JOBS,
+            )
+
+            elapsed_ws = time.perf_counter() - t0
+            corrected_mean_ws = np.mean(corrected_ws, axis=0).astype(np.float32)
+
+            summary_ws, gauge_ws = summarize_run(
+                name="warmstart_phase3_refine",
+                backend=WARM_START_BACKEND,
+                cfg=warm_cfg,
+                algorithm="mapem",
+                elapsed=elapsed_ws,
+                final_ref=final_ref_ws,
+                corrected=corrected_ws,
+                params=params_ws,
+                meta=meta_ws,
+                gt_img=gt_img,
+                geo=geo,
+                mask=mask,
+            )
+
+            summary_rows.append(summary_ws)
+
+            weights_ws = np.asarray(meta_ws.get("last_weights", np.ones(params_ws.shape[0])), dtype=np.float32)
+            image_scores_ws = np.asarray(meta_ws.get("last_image_scores", params_ws[:, 3]), dtype=np.float32)
+            posterior_scores_ws = np.asarray(meta_ws.get("last_posterior_scores", params_ws[:, 3]), dtype=np.float32)
+
+            if SAVE_OUTPUTS:
+                save_params_csv(
+                    outdir / "warmstart_phase3_refine_params_weights.csv",
+                    params_ws,
+                    weights_ws,
+                    image_scores_ws,
+                    posterior_scores_ws,
+                )
+                save_iteration_csv(
+                    outdir / "warmstart_phase3_refine_iteration_summary.csv",
+                    meta_ws,
+                )
+                np.save(outdir / "warmstart_phase3_refine_final_ref.npy", final_ref_ws)
+                np.save(outdir / "warmstart_phase3_refine_corrected_mean.npy", corrected_mean_ws)
+
+            results.append({
+                "name": "warmstart_phase3_refine",
+                "backend": WARM_START_BACKEND,
+                "phase_name": "warmstart_phase3_refine",
+                "cfg": warm_cfg,
+                "algorithm": "mapem",
+                "final_ref": final_ref_ws,
+                "corrected_mean": corrected_mean_ws,
+                "params": params_ws,
+                "meta": meta_ws,
+                "weights": weights_ws,
+                "image_scores": image_scores_ws,
+                "posterior_scores": posterior_scores_ws,
+                "gauge": gauge_ws,
+            })
+
+            print(
+                f"warmstart_phase3_refine: elapsed={elapsed_ws:.2f}s, "
+                f"effective_n={summary_ws['effective_n']:.2f}, "
+                f"weight_mean={summary_ws['weight_mean']:.3f}, "
+                f"shift_mean={summary_ws['shift_mean_px']:.2f}px, "
+                f"large_shift_gt20={summary_ws['large_shift_gt20_count']}, "
+                f"gauge_corr={summary_ws['corrected_mean_gauge_corr']}"
+            )
+
+            print("[warm-start] meta checks:")
+            print("  meta['has_initial_params'] =", meta_ws["has_initial_params"])
+            print("  meta['search_mode'] =", meta_ws["search_mode"])
+            if meta_ws.get("iterations"):
+                print("  meta['iterations'][0]['schedule'] =", meta_ws["iterations"][0]["schedule"])
+    
+    
+    
+    
+    
     summary_df = pd.DataFrame(summary_rows)
     print("\n=== Phase summary ===")
     with pd.option_context("display.max_columns", None, "display.width", 220):

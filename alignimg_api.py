@@ -143,6 +143,28 @@ def make_mapem_config(
     )
 
 
+def _resolve_initial_params(initial_params=None, previous_params=None, warm_start_params=None):
+    provided = [
+        name
+        for name, value in (
+            ("initial_params", initial_params),
+            ("previous_params", previous_params),
+            ("warm_start_params", warm_start_params),
+        )
+        if value is not None
+    ]
+    if len(provided) > 1:
+        raise ValueError(
+            "Use only one pose warm-start argument: "
+            "initial_params, previous_params, or warm_start_params."
+        )
+    if previous_params is not None:
+        return previous_params
+    if warm_start_params is not None:
+        return warm_start_params
+    return initial_params
+
+
 def run_alignment(
     X,
     initial_ref,
@@ -154,6 +176,10 @@ def run_alignment(
     config: Optional[au.MAPEMConfig] = None,
     n_jobs=None,
     chunksize=1,
+    initial_params=None,
+    previous_params=None,
+    warm_start_params=None,
+    search_mode: Optional[str] = None,
     **kwargs,
 ):
     """Run alignment through the public backend dispatcher.
@@ -174,9 +200,25 @@ def run_alignment(
     Common MAP-EM kwargs include:
         phase, weight_mode, keep_fraction, lambda_shift,
         sigma_shift_y, sigma_shift_x, lambda_angle, sigma_angle.
+
+    Pose warm starts:
+        Pass initial_params, previous_params, or warm_start_params with shape
+        (N, 3) or (N, 4). The canonical convention is preserved:
+        params = [angle, dy, dx, score]. Warm-started MAP-EM skips the initial
+        global angle sweep and runs local refinement from these angles.
+
+    search_mode:
+        "auto" preserves existing behavior, "refine" forces local warm-start
+        refinement from initial_params, and "global" uses the cold-start
+        schedule.
     """
     backend = normalize_backend_name(backend)
     algorithm = normalize_algorithm_name(algorithm)
+    pose_seed = _resolve_initial_params(
+        initial_params=initial_params,
+        previous_params=previous_params,
+        warm_start_params=warm_start_params,
+    )
 
     if backend == "multicore":
         if algorithm == "classic":
@@ -196,6 +238,8 @@ def run_alignment(
             verbose=verbose,
             n_jobs=n_jobs,
             chunksize=chunksize,
+            initial_params=pose_seed,
+            search_mode=search_mode,
         )
 
     if backend == "gpu":
@@ -208,6 +252,8 @@ def run_alignment(
         raise ValueError(f"Unsupported backend: {backend}")
 
     if algorithm == "classic":
+        if pose_seed is not None:
+            raise NotImplementedError("Pose warm starts are currently implemented for algorithm='mapem' only.")
         return au.run_alignment_single_cpu(
             X,
             initial_ref,
@@ -225,6 +271,8 @@ def run_alignment(
             mask_diameter=mask_diameter,
             config=cfg,
             verbose=verbose,
+            initial_params=pose_seed,
+            search_mode=search_mode,
         )
 
     raise ValueError(f"Unsupported algorithm: {algorithm}")
