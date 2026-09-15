@@ -10,8 +10,7 @@ RE2DC or ASCEP MRA search engine.
 
 Detailed upstream contributors, source paths, copyright holders, and licensing
 terms are recorded in the RE2DC and RE2DC GPU notices distributed with this
-package and, in the source repository, under `Reference/re2dc/` and
-`Reference/re2dc-gpu/`.
+package and stored in the source repository under `third_party/`.
 
 RELION provided scientific inspiration for AlignImg's MAP/Bayesian pose-search
 design. No RELION source code is distributed as part of AlignImg, and AlignImg

@@ -456,8 +456,8 @@ possible.
 
 Repository-level source attribution, contributor information, and licensing
 details are documented in the [third-party notices](THIRD_PARTY_NOTICES.md), the
-[source-lineage map](docs/PROVENANCE.md), and the notices accompanying the
-reference sources under [`Reference/`](Reference/).
+[source-lineage map](docs/PROVENANCE.md), and the detailed notices under
+[`third_party/`](third_party/).
 
 ## Documentation and validation
 

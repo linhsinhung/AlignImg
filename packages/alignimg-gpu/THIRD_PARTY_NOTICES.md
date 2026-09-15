@@ -33,7 +33,7 @@ University of Texas - Houston Medical School and the Max Planck Institute of
 Molecular Physiology. Those sources include a GNU GPL version 2-or-later grant;
 this package is distributed under GPL-3.0-or-later.
 
-The complete reference notices and archived paths are available in the AlignImg
-source repository under `Reference/re2dc/` and `Reference/re2dc-gpu/`. This
-package preserves the contributor, source, and license information needed to
-understand that lineage even when the archived reference tree is not installed.
+The complete reference notices are available in the AlignImg source repository
+under `third_party/`. This package preserves the contributor, source-path, and
+license information needed to understand that lineage without distributing the
+archived reference implementations.

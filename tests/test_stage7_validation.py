@@ -10,6 +10,11 @@ import pytest
 from tools import stage7_validation as stage7
 
 
+def require_dev10_manifest() -> None:
+    if not stage7.DEFAULT_DEV10_MANIFEST.is_file():
+        pytest.skip("requires the private accepted dev10 manifest")
+
+
 def write_result_bundle(base: Path, seed: int) -> dict[str, str]:
     result = base / f"seed-{seed}.result.npz"
     references = base / f"seed-{seed}.references.mrcs"
@@ -73,6 +78,7 @@ def formal_report(tmp_path: Path) -> dict:
 
 
 def test_dev10_compute_sources_remain_frozen():
+    require_dev10_manifest()
     result = stage7.verify_dev10_compute_freeze()
     assert result["baseline_version"] == "2.1.0.dev10"
     assert len(result["files"]) == len(stage7.FROZEN_COMPUTE_FILES)
@@ -80,6 +86,7 @@ def test_dev10_compute_sources_remain_frozen():
 
 
 def test_dev10_compute_freeze_rejects_changed_hash(tmp_path: Path):
+    require_dev10_manifest()
     original = json.loads(stage7.DEFAULT_DEV10_MANIFEST.read_text(encoding="utf-8"))
     original["files"][stage7.FROZEN_COMPUTE_FILES[0]] = "0" * 64
     manifest = tmp_path / "manifest.json"

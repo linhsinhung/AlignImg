@@ -1,10 +1,9 @@
 include README.md
 include LICENSE
+include GPL-3.0.txt
 include THIRD_PARTY_NOTICES.md
-include Reference/re2dc/LICENSE
-include Reference/re2dc/THIRD_PARTY_NOTICES.md
-include Reference/re2dc-gpu/LICENSE
-include Reference/re2dc-gpu/THIRD_PARTY_NOTICES.md
+include third_party/RE2DC_THIRD_PARTY_NOTICES.md
+include third_party/RE2DC_GPU_THIRD_PARTY_NOTICES.md
 include pyproject.toml
 recursive-include docs *.md
 

@@ -7,7 +7,10 @@ build/
 dist/
 
 # Local data and generated example outputs
-data/local/
+/Reference/
+/data/
+/legacy/
+/validation-results/
 *.mrc
 *.mrcs
 *.npy

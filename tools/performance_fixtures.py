@@ -29,7 +29,7 @@ def sha256(path: Path) -> str:
 
 
 def source_manifest(root: Path = ROOT) -> dict:
-    roots = ("src", "packages", "tools", "tests", "docs", "examples")
+    roots = ("src", "packages", "tools", "tests", "docs", "examples", "third_party")
     excluded = {"__pycache__", "build", "dist", ".DS_Store"}
     paths = [
         root / name
@@ -38,8 +38,8 @@ def source_manifest(root: Path = ROOT) -> dict:
             "MANIFEST.in",
             "README.md",
             "LICENSE",
+            "GPL-3.0.txt",
             "THIRD_PARTY_NOTICES.md",
-            "Reference/re2dc/LICENSE",
         )
     ]
     for name in roots:

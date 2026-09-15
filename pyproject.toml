@@ -14,11 +14,10 @@ authors = [
 license = "GPL-3.0-or-later"
 license-files = [
   "LICENSE",
+  "GPL-3.0.txt",
   "THIRD_PARTY_NOTICES.md",
-  "Reference/re2dc/LICENSE",
-  "Reference/re2dc/THIRD_PARTY_NOTICES.md",
-  "Reference/re2dc-gpu/LICENSE",
-  "Reference/re2dc-gpu/THIRD_PARTY_NOTICES.md",
+  "third_party/RE2DC_THIRD_PARTY_NOTICES.md",
+  "third_party/RE2DC_GPU_THIRD_PARTY_NOTICES.md",
 ]
 keywords = ["image alignment", "cryo-EM", "MAP-EM", "multiprocessing", "scientific computing"]
 classifiers = [
