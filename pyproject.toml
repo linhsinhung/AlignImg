@@ -12,7 +12,14 @@ authors = [
   {name = "Hsin-Hung Lin"}
 ]
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE", "Reference/re2dc/LICENSE", "THIRD_PARTY_NOTICES.md"]
+license-files = [
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "Reference/re2dc/LICENSE",
+  "Reference/re2dc/THIRD_PARTY_NOTICES.md",
+  "Reference/re2dc-gpu/LICENSE",
+  "Reference/re2dc-gpu/THIRD_PARTY_NOTICES.md",
+]
 keywords = ["image alignment", "cryo-EM", "MAP-EM", "multiprocessing", "scientific computing"]
 classifiers = [
   "Development Status :: 3 - Alpha",

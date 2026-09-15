@@ -2,6 +2,9 @@ include README.md
 include LICENSE
 include THIRD_PARTY_NOTICES.md
 include Reference/re2dc/LICENSE
+include Reference/re2dc/THIRD_PARTY_NOTICES.md
+include Reference/re2dc-gpu/LICENSE
+include Reference/re2dc-gpu/THIRD_PARTY_NOTICES.md
 include pyproject.toml
 recursive-include docs *.md
 

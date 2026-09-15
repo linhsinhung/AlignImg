@@ -21,7 +21,8 @@ cached particle Fourier transforms, and soft Fourier reference updates.
 [Features](#features) · [Installation](#installation) ·
 [Quick start](#quick-start-align-a-stack-to-a-reference) ·
 [RF and class feedback](#other-alignment-workflows) ·
-[Outputs](#results-and-raw-particle-averages) · [GUI](#optional-gui)
+[Outputs](#results-and-raw-particle-averages) · [GUI](#optional-gui) ·
+[Provenance](#acknowledgements-and-provenance)
 
 ## Features
 
@@ -413,9 +414,55 @@ alignimg-gui
 The GUI requires PyQt6 and a graphical desktop. It works with the CPU backend or
 the separately installed GPU package.
 
+## Acknowledgements and provenance
+
+AlignImg was developed by Hsin-Hung Lin and draws on two technical lineages.
+
+- **ASCEP/RE2DC lineage.** The historical ASCEP workflow used alignment
+  functionality from EMAN2, SPARX, and SPHIRE, together with CUDA alignment work
+  later documented through Cryo-RALib, to support its classification pipeline.
+  During the development of standalone RE2DC implementations, relevant
+  algorithmic behavior was studied and ported or reimplemented from the
+  attributed open-source Python, C++, and CUDA sources so that RE2DC's production
+  RF/MRA paths could run without requiring Scipion or an installed EMAN2/SPHIRE
+  environment. The ASCEP/Cryo-RALib CUDA implementation and the experience gained
+  while validating it provided important technical references for RE2DC's native
+  CUDA search backend and for subsequent AlignImg GPU development. AlignImg's
+  present GPU backend is a separate, later hybrid implementation combining native
+  CUDA/C++ kernels with CuPy FFT/scoring and Python controller stages.
+- **Earlier AlignImg lineage.** In a separate project, the author developed the
+  original AlignImg as an early model of a convenient single-reference 2-D
+  alignment API for in-memory image arrays and MRC/MRCS stacks, using a robust
+  MAP-style iterative alignment design. Its pose-prior and posterior-search design
+  was informed by Bayesian/MAP ideas exemplified by RELION. AlignImg does not
+  reproduce RELION's complete CTF, noise, likelihood, or regularized-reconstruction
+  model.
+- **Current AlignImg.** The present library unifies the efficient RF/MRA work
+  and attributed reference implementations carried through RE2DC with the API and
+  robust alignment framework developed in earlier AlignImg. Its RF, MRA,
+  refinement, Fourier-domain scoring and reference updates, continuous quadratic
+  pose refinement, and bounded-memory execution architecture reflect subsequent
+  scientific and engineering decisions by Hsin-Hung Lin.
+
+AI tools assisted with source analysis, comparison, porting, implementation,
+experimentation, documentation, and validation. Hsin-Hung Lin directed the design
+and evaluation of AlignImg and is responsible for the resulting software and its
+claims.
+
+The author gratefully acknowledges the ASCEP and RE2DC collaborators; the
+Cryo-RALib, GPU ISAC, and CUDA alignment contributors; and the EMAN2, SPARX,
+SPHIRE, and RELION developers and communities whose work made this development
+possible.
+
+Repository-level source attribution, contributor information, and licensing
+details are documented in the [third-party notices](THIRD_PARTY_NOTICES.md), the
+[source-lineage map](docs/PROVENANCE.md), and the notices accompanying the
+reference sources under [`Reference/`](Reference/).
+
 ## Documentation and validation
 
 - [Public API and configuration](docs/API.md)
+- [Acknowledgements and source lineage](docs/PROVENANCE.md)
 - [Unified alignment model](docs/UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md) (Traditional Chinese)
 - [Continuous quadratic refinement](docs/CONTINUOUS_QUADRATIC_REFINEMENT_2_2.md)
 - [GPU installation and execution](packages/alignimg-gpu/README.md)
