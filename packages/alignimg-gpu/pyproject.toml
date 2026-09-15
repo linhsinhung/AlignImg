@@ -1,0 +1,26 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.12",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "alignimg-gpu"
+version = "2.2.0"
+description = "Optional single-NVIDIA-GPU backend for AlignImg 2.x"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = ["alignimg>=2.2.0,<3", "numpy"]
+
+[project.optional-dependencies]
+cuda12 = ["cupy-cuda12x>=14"]
+cuda13 = ["cupy-cuda13x>=14"]
+
+[tool.scikit-build]
+cmake.version = ">=3.24"
+wheel.packages = ["src/alignimg_gpu"]
+sdist.include = ["CMakeLists.txt", "src/alignimg_gpu/native/**"]
+sdist.exclude = ["build", "dist", "src/alignimg_gpu.egg-info"]

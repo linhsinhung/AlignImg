@@ -1,0 +1,21 @@
+# Python caches / build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Local data and generated example outputs
+data/local/
+*.mrc
+*.mrcs
+*.npy
+*.npz
+examples/realdata_*/
+realdata_*/
+accuracy_report*/
+minimal_report*/
+
+# OS/editor noise
+.DS_Store
