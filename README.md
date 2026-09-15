@@ -5,7 +5,14 @@ multi-reference alignment, and continuous pose refinement.**
 
 AlignImg 2.2 estimates in-plane rotations and translations, then reconstructs
 reference/class-average images. Its Python API can be used before or between
-steps of an external classification workflow. EMAN2 and RELION are not required.
+steps of an external classification workflow.
+
+AlignImg was developed by studying the alignment concepts, published methods,
+and practical workflows established by EMAN2 and RELION. With AI-assisted
+analysis, those ideas were distilled and re-examined, then combined with the
+author's own algorithmic insights and design choices. The author gratefully
+acknowledges the EMAN2 and RELION developers and communities for the scientific
+foundations and inspiration that made this work possible.
 
 A complete CPU backend is included. An optional GPU package provides native CUDA
 acceleration and a CuPy fallback. The default engine uses Fourier NCC scoring,
