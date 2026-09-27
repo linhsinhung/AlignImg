@@ -48,7 +48,7 @@ from .widgets import (
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("AlignImg Workbench 0.5")
+        self.setWindowTitle("AlignImg Workbench 0.7")
         self.resize(1440, 920)
         self.process: QProcess | None = None
         self.current_run_directory: Path | None = None
@@ -176,6 +176,9 @@ class MainWindow(QMainWindow):
             ("CPU", "cpu"),
         ):
             self.backend.addItem(label, value)
+        self.pipeline_strategy = QComboBox()
+        self.pipeline_strategy.addItem("Balanced + precise (default)", "balanced")
+        self.pipeline_strategy.addItem("Fast 3 exploration", "fast3")
         self.global_iterations = self._spin(1, 1000, 15)
         self.refine_enabled = QCheckBox("Run local refinement")
         self.refine_enabled.setChecked(True)
@@ -200,6 +203,7 @@ class MainWindow(QMainWindow):
         self.corrective_trust = self._double(0.0, 1.0, 0.9, decimals=2, step=0.05)
         self.reset_preset = QPushButton("Reset pipeline preset")
         workflow_form.addRow("Backend", self.backend)
+        workflow_form.addRow("Pipeline strategy", self.pipeline_strategy)
         workflow_form.addRow("Global iterations", self.global_iterations)
         workflow_form.addRow(self.refine_enabled)
         workflow_form.addRow("Refine iterations", self.refine_iterations)
@@ -222,14 +226,17 @@ class MainWindow(QMainWindow):
         self.search_strategy = QComboBox()
         self.search_strategy.addItem("Polar proposal", "proposal")
         self.search_strategy.addItem("Adaptive posterior", "adaptive_posterior")
+        self.search_strategy.addItem("Fast hard (custom)", "polar_hard")
         self.candidate_scoring = QComboBox()
         self.candidate_scoring.addItem("Fourier-native", "fourier")
         self.candidate_scoring.addItem("Raster compatibility", "raster")
+        self.candidate_scoring.addItem("Polar rings", "polar")
         self.score_model = QComboBox()
         self.score_model.addItem("Fourier NCC", "fourier_ncc")
         self.score_model.addItem(
             "Empirical-whitened Fourier NCC", "whitened_fourier_ncc"
         )
+        self.score_model.addItem("Polar ring CCF", "polar_ring_ccf")
         self.reference_update = QComboBox()
         self.reference_update.addItem("Fourier M-step", "fourier")
         self.reference_update.addItem("Spatial compatibility", "spatial")
@@ -339,6 +346,7 @@ class MainWindow(QMainWindow):
         self.refine_search_strategy.currentIndexChanged.connect(
             self._refine_strategy_changed
         )
+        self.pipeline_strategy.currentIndexChanged.connect(self._apply_preset)
         self.search_strategy.currentIndexChanged.connect(self._search_strategy_changed)
         self.reset_preset.clicked.connect(self._apply_preset)
         self.advanced_toggle.toggled.connect(self._toggle_advanced)
@@ -386,13 +394,22 @@ class MainWindow(QMainWindow):
             self._mode() == "reference_based"
             and self.reference_start.currentData() == "previous"
         )
+        fast3 = self.pipeline_strategy.currentData() == "fast3"
+        if resume and fast3:
+            self.pipeline_strategy.setCurrentIndex(
+                self.pipeline_strategy.findData("balanced")
+            )
+            fast3 = False
         self.previous.setEnabled(resume)
-        self.global_iterations.setEnabled(not resume)
+        self.pipeline_strategy.setEnabled(not resume)
+        self.global_iterations.setEnabled(not resume and not fast3)
+        self.apply_final_pose_to_raw.setEnabled(not fast3)
+        self.search_strategy.setEnabled(not fast3)
         if resume:
             self.refine_enabled.setChecked(True)
             self.refine_enabled.setEnabled(False)
         else:
-            self.refine_enabled.setEnabled(True)
+            self.refine_enabled.setEnabled(not fast3)
         self._refine_changed()
 
     def _refine_changed(self) -> None:
@@ -406,11 +423,60 @@ class MainWindow(QMainWindow):
         self._search_strategy_changed()
 
     def _search_strategy_changed(self) -> None:
-        global_adaptive = self.search_strategy.currentData() == "adaptive_posterior"
+        global_strategy = self.search_strategy.currentData()
+        global_adaptive = global_strategy == "adaptive_posterior"
+        global_fast = global_strategy == "polar_hard"
+        if global_fast:
+            config = AlignmentConfig.preset("fast_hard")
+            self.candidate_scoring.setCurrentIndex(
+                self.candidate_scoring.findData(config.candidate_scoring)
+            )
+            self.score_model.setCurrentIndex(
+                self.score_model.findData(config.score_model)
+            )
+            self.reference_update.setCurrentIndex(
+                self.reference_update.findData(config.reference_update)
+            )
+            self.top_l.setValue(config.top_l)
+            self.proposal_angles.setValue(0)
+            self.temperature_start.setValue(config.temperature_start)
+            self.temperature_end.setValue(config.temperature_end)
+            self.anneal_iterations.setValue(0)
+            self.halfset.setChecked(False)
+        elif self.candidate_scoring.currentData() == "polar":
+            preset_name = (
+                "reference_free"
+                if self._mode() == "reference_free"
+                else "global_balanced"
+            )
+            config = AlignmentConfig.preset(preset_name)
+            self.candidate_scoring.setCurrentIndex(
+                self.candidate_scoring.findData(config.candidate_scoring)
+            )
+            self.score_model.setCurrentIndex(
+                self.score_model.findData(config.score_model)
+            )
+            self.reference_update.setCurrentIndex(
+                self.reference_update.findData(config.reference_update)
+            )
+            self.top_l.setValue(config.top_l)
+            self.proposal_angles.setValue(config.proposal_angles_per_reference or 0)
+            self.temperature_start.setValue(config.temperature_start)
+            self.temperature_end.setValue(config.temperature_end)
+            self.anneal_iterations.setValue(config.temperature_anneal_iterations or 0)
+            self.halfset.setChecked(config.halfset_diagnostics)
         refine_strategy = self.refine_search_strategy.currentData()
         refine_local = self.refine_enabled.isChecked()
         refine_adaptive = refine_local and refine_strategy == "adaptive_posterior"
-        self.proposal_angles.setEnabled(not global_adaptive)
+        self.proposal_angles.setEnabled(global_strategy == "proposal")
+        for widget in (
+            self.candidate_scoring,
+            self.score_model,
+            self.reference_update,
+            self.top_l,
+            self.halfset,
+        ):
+            widget.setEnabled(not global_fast)
         for widget in (
             self.coarse_angle_step,
             self.local_angle_range,
@@ -451,16 +517,20 @@ class MainWindow(QMainWindow):
 
     def _apply_preset(self) -> None:
         mode = self._mode()
-        preset_name = (
-            "reference_free" if mode == "reference_free" else "global_balanced"
-        )
-        config = AlignmentConfig.preset(preset_name)
-        if mode == "reference_free":
+        fast3 = self.pipeline_strategy.currentData() == "fast3"
+        if fast3:
+            config = AlignmentConfig.preset("fast3")
+        else:
+            preset_name = (
+                "reference_free" if mode == "reference_free" else "global_balanced"
+            )
+            config = AlignmentConfig.preset(preset_name)
+        if mode == "reference_free" and not fast3:
             config = replace(
                 config, max_iterations=15, temperature_anneal_iterations=10
             )
         self.global_iterations.setValue(config.max_iterations)
-        self.refine_enabled.setChecked(True)
+        self.refine_enabled.setChecked(not fast3)
         self.refine_iterations.setValue(2)
         refine_config = AlignmentConfig.preset("refine")
         self.refine_search_strategy.setCurrentIndex(
@@ -468,7 +538,7 @@ class MainWindow(QMainWindow):
         )
         self.refine_policy.setCurrentIndex(self.refine_policy.findData("soft"))
         self.corrective_trust.setValue(0.9)
-        self.apply_final_pose_to_raw.setChecked(False)
+        self.apply_final_pose_to_raw.setChecked(config.apply_final_pose_to_raw)
         strategy_index = self.search_strategy.findData(config.search_strategy)
         self.search_strategy.setCurrentIndex(strategy_index)
         self.candidate_scoring.setCurrentIndex(
@@ -561,14 +631,28 @@ class MainWindow(QMainWindow):
         )
 
     def _refine_config(self) -> dict:
+        fast_global = self.search_strategy.currentData() == "polar_hard"
+        precise = AlignmentConfig.preset("refine")
         return asdict(
             replace(
-                AlignmentConfig.preset("refine"),
+                precise,
                 max_iterations=self.refine_iterations.value(),
                 search_strategy=self.refine_search_strategy.currentData(),
-                candidate_scoring=self.candidate_scoring.currentData(),
-                score_model=self.score_model.currentData(),
-                reference_update=self.reference_update.currentData(),
+                candidate_scoring=(
+                    precise.candidate_scoring
+                    if fast_global
+                    else self.candidate_scoring.currentData()
+                ),
+                score_model=(
+                    precise.score_model
+                    if fast_global
+                    else self.score_model.currentData()
+                ),
+                reference_update=(
+                    precise.reference_update
+                    if fast_global
+                    else self.reference_update.currentData()
+                ),
                 coarse_angle_step=self.coarse_angle_step.value(),
                 coarse_shift_step=self.coarse_shift_step.value(),
                 local_angle_range=self.local_angle_range.value(),
@@ -586,7 +670,7 @@ class MainWindow(QMainWindow):
                 weight_temperature=self.weight_temperature.value(),
                 pose_angle_sigma=self.pose_angle_sigma.value(),
                 pose_shift_sigma=self.pose_shift_sigma.value(),
-                halfset_diagnostics=self.halfset.isChecked(),
+                halfset_diagnostics=(True if fast_global else self.halfset.isChecked()),
                 center_references=self.center.isChecked(),
                 lowpass_sigma=self.lowpass_sigma.value(),
                 store_history=self.store_history.isChecked(),

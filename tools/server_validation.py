@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -2481,6 +2481,73 @@ def execution_profiling_case(backend: str, batch_size: int) -> dict[str, Any]:
     return profiling_case(backend, batch_size)
 
 
+def fast3_case(backend: str, batch_size: int) -> dict[str, Any]:
+    """Exercise the release preset on small K=1, fixed MRA, and RF workloads."""
+    config = replace(ai.AlignmentConfig.preset("fast3"), batch_size=batch_size)
+    images, references, labels, _ = make_dataset(6, 32, 2, None, 230, 256)
+    priors = ai.make_class_priors(assignments=labels, n_components=2)
+    operations = {
+        "k1": lambda: ai.align_to_references(
+            images[labels == 0], references[:1], config=config, backend=backend
+        ),
+        "fixed_mra": lambda: ai.align_to_references(
+            images, references, class_priors=priors, config=config, backend=backend
+        ),
+        "reference_free": lambda: ai.reference_free_align(
+            images, n_components=2, config=config, backend=backend
+        ),
+    }
+    reports = {}
+    for name, operation in operations.items():
+        result = operation()
+        repeated = operation()
+        for field in ("angle_deg", "shift_y_px", "shift_x_px", "mirror"):
+            np.testing.assert_array_equal(
+                getattr(result.poses, field), getattr(repeated.poses, field)
+            )
+        for field in (
+            "reference_assignments",
+            "responsibilities",
+            "references",
+            "class_averages",
+            "inlier_weights",
+        ):
+            values = getattr(result, field)
+            assert np.all(np.isfinite(values)), (name, field)
+            np.testing.assert_array_equal(values, getattr(repeated, field))
+        expected = np.eye(len(result.references), dtype=np.float32)[
+            result.reference_assignments
+        ]
+        np.testing.assert_array_equal(result.responsibilities, expected)
+        if name == "fixed_mra":
+            np.testing.assert_array_equal(result.reference_assignments, labels)
+        metadata = result.metadata
+        assert metadata["search_strategy"] == "polar_hard"
+        assert (
+            metadata["class_average_estimator"] == "final_map_pose_inlier_weighted_raw"
+        )
+        assert len(result.diagnostics) == 3
+        if backend in {"cpu", "cuda", "cupy"}:
+            assert metadata["backend"] == backend
+        if metadata["backend"] in {"cuda", "cupy"}:
+            expected_backend = (
+                "native_cuda" if metadata["backend"] == "cuda" else "cupy"
+            )
+            assert metadata["polar_sampler_backend"] == expected_backend
+            assert metadata["polar_peak_backend"] == expected_backend
+            assert metadata["polar_full_correlation_map_d2h"] is False
+            assert metadata["gpu_workspace"]["closed"]
+        reports[name] = {
+            "deterministic_exact_match": True,
+            "iterations": len(result.diagnostics),
+            "occupancy": np.bincount(
+                result.reference_assignments, minlength=len(result.references)
+            ),
+            "metadata": metadata,
+        }
+    return {"config": asdict(config), "workflows": reports}
+
+
 def suite_cases(
     suite: str, backend: str, batch_size: int
 ) -> list[tuple[str, Callable[[], dict[str, Any]]]]:
@@ -2519,6 +2586,7 @@ def suite_cases(
         ),
         ("polar_proposal_recall", proposal_recall_case),
         ("quadratic_refine", lambda: quadratic_refine_case(backend, batch_size)),
+        ("fast3", lambda: fast3_case(backend, batch_size)),
     ]
     if suite == "quick":
         cases.extend(

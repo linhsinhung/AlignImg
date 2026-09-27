@@ -47,11 +47,33 @@ def test_proposal_angle_budget_is_independent_and_validated():
 def test_workflow_presets_are_explicit_and_distinct():
     balanced = ai.AlignmentConfig.preset("global_balanced")
     accurate = ai.AlignmentConfig.preset("global_accurate")
+    fast_hard = ai.AlignmentConfig.preset("fast_hard")
+    fast3 = ai.AlignmentConfig.preset("fast3")
     reference_free = ai.AlignmentConfig.preset("reference_free")
     refine = ai.AlignmentConfig.preset("refine")
     assert balanced.proposal_angles_per_reference == 6
     assert accurate.proposal_angles_per_reference == 8
     assert balanced.temperature_end == accurate.temperature_end == 0.05
+    assert fast_hard.search_strategy == "polar_hard"
+    assert fast_hard.candidate_scoring == "polar"
+    assert fast_hard.score_model == "polar_ring_ccf"
+    assert fast_hard.reference_update == "fourier"
+    assert fast_hard.top_l == 1
+    assert fast_hard.proposal_angles_per_reference is None
+    assert fast_hard.halfset_diagnostics is False
+    assert fast_hard.max_iterations == 10
+    assert fast_hard.apply_final_pose_to_raw is False
+    assert fast_hard.normalized(workflow="global") == fast_hard
+    assert fast3.search_strategy == "polar_hard"
+    assert fast3.candidate_scoring == "polar"
+    assert fast3.score_model == "polar_ring_ccf"
+    assert fast3.reference_update == "fourier"
+    assert fast3.top_l == 1
+    assert fast3.proposal_angles_per_reference is None
+    assert fast3.halfset_diagnostics is False
+    assert fast3.max_iterations == 3
+    assert fast3.apply_final_pose_to_raw is True
+    assert fast3.normalized(workflow="global") == fast3
     assert reference_free.top_l == 4
     assert reference_free.temperature_end == 0.02
     assert reference_free.temperature_anneal_iterations == 10
@@ -101,8 +123,7 @@ def test_polar_proposals_use_inverse_angle_and_keep_180_degree_pair():
             prepared_particle.polar[0], prepared_reference.polar[0], 4
         )
         errors = [
-            abs((angle + source_angle + 180.0) % 360.0 - 180.0)
-            for angle in proposals
+            abs((angle + source_angle + 180.0) % 360.0 - 180.0) for angle in proposals
         ]
         assert min(errors) <= 5.0
         pair_delta = (proposals[1] - proposals[0]) % 360.0
@@ -219,7 +240,9 @@ def test_reference_free_bootstrap_is_seeded_and_records_components():
     two = ai.reference_free_align(images, n_components=2, config=config)
 
     assert one.references.shape == (2, 24, 24)
-    assert np.array_equal(one.metadata["bootstrap_labels"], two.metadata["bootstrap_labels"])
+    assert np.array_equal(
+        one.metadata["bootstrap_labels"], two.metadata["bootstrap_labels"]
+    )
     assert np.allclose(one.references, two.references)
     assert "component_weight_cv" in one.diagnostics[-1]
     assert "maximum_offdiagonal_reference_correlation" in one.diagnostics[-1]
@@ -379,7 +402,10 @@ def test_v1_input_validation_and_explicit_gpu_failure():
         )
     with pytest.raises(ValueError, match="class_priors"):
         ai.align_to_references(
-            reference[None], reference, class_priors=np.zeros((1, 1)), config=fast_config()
+            reference[None],
+            reference,
+            class_priors=np.zeros((1, 1)),
+            config=fast_config(),
         )
     if not ai.available_alignment_backends()["gpu"]["available"]:
         with pytest.raises(RuntimeError, match="alignimg-gpu"):
@@ -395,5 +421,10 @@ def test_legacy_pose_adaptor_is_explicit_and_rejects_mirror():
     assert np.allclose(restored, legacy)
     with pytest.raises(ValueError, match="mirror"):
         ai.poses_to_legacy_params(
-            ai.PoseSet(poses.angle_deg, poses.shift_y_px, poses.shift_x_px, np.ones(1, dtype=bool))
+            ai.PoseSet(
+                poses.angle_deg,
+                poses.shift_y_px,
+                poses.shift_x_px,
+                np.ones(1, dtype=bool),
+            )
         )

@@ -159,6 +159,7 @@ def test_cpu_workflow_can_select_fourier_native_candidate_scoring(
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_gpu_fourier_native_transform_matches_cpu_when_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:
@@ -192,6 +193,7 @@ def test_gpu_fourier_native_transform_matches_cpu_when_available(backend: str):
     assert np.allclose(actual, expected, rtol=3e-5, atol=3e-4)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_gpu_fourier_native_scores_match_cpu_when_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:
@@ -239,6 +241,7 @@ def test_gpu_fourier_native_scores_match_cpu_when_available(backend: str):
     assert np.allclose(actual, expected, atol=2e-5)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_gpu_workflow_uses_fourier_native_candidate_scoring_when_available(
     backend: str,

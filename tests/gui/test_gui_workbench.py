@@ -187,7 +187,39 @@ def test_main_window_can_be_created_offscreen(monkeypatch):
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     assert window.mode_tabs.currentIndex() == 0
+    assert window.pipeline_strategy.currentData() == "balanced"
     assert window.global_iterations.value() == 15
+
+    window.pipeline_strategy.setCurrentIndex(window.pipeline_strategy.findData("fast3"))
+    assert window.global_iterations.value() == 3
+    assert not window.global_iterations.isEnabled()
+    assert not window.refine_enabled.isChecked()
+    assert not window.refine_enabled.isEnabled()
+    assert window.apply_final_pose_to_raw.isChecked()
+    assert not window.apply_final_pose_to_raw.isEnabled()
+    assert window.search_strategy.currentData() == "polar_hard"
+    assert not window.search_strategy.isEnabled()
+    fast3 = window._global_config()
+    assert fast3["max_iterations"] == 3
+    assert fast3["search_strategy"] == "polar_hard"
+    assert fast3["candidate_scoring"] == "polar"
+    assert fast3["score_model"] == "polar_ring_ccf"
+    assert fast3["top_l"] == 1
+    assert fast3["apply_final_pose_to_raw"] is True
+
+    window.pipeline_strategy.setCurrentIndex(
+        window.pipeline_strategy.findData("balanced")
+    )
+    assert window.global_iterations.value() == 15
+    assert window.global_iterations.isEnabled()
+    assert window.refine_enabled.isChecked()
+    assert window.refine_enabled.isEnabled()
+    assert not window.apply_final_pose_to_raw.isChecked()
+    assert window.apply_final_pose_to_raw.isEnabled()
+    assert window.search_strategy.currentData() == "proposal"
+    assert window.search_strategy.isEnabled()
+    window.close()
+    app.processEvents()
 
 
 @pytest.mark.parametrize("components", [1, 10])
@@ -232,7 +264,7 @@ def test_main_window_displays_reference_free_report_without_refinement(
         )
     )
     execute_run(spec)
-    app = QApplication.instance() or QApplication([])
+    _app = QApplication.instance() or QApplication([])
     window = MainWindow()
     window._display_report(run_directory / "report.json")
     window.results.refresh()
@@ -279,6 +311,7 @@ def test_main_window_displays_reference_based_mra_report(monkeypatch, tmp_path: 
     window._display_report(run_directory / "report.json")
     window.results.refresh()
     assert window.results.gallery_layout.count() == 1
+    assert window.pipeline_strategy.currentData() == "balanced"
     assert window.refine_enabled.isChecked()
     assert window.refine_iterations.value() == 2
     assert window.candidate_scoring.currentData() == "fourier"
@@ -289,6 +322,23 @@ def test_main_window_displays_reference_based_mra_report(monkeypatch, tmp_path: 
     assert window._refine_config()["coarse_angle_step"] == 1.0
     assert window._refine_config()["local_angle_range"] == 7.0
     assert window._refine_config()["local_shift_range"] == 3.0
+    window.search_strategy.setCurrentIndex(
+        window.search_strategy.findData("polar_hard")
+    )
+    fast_config = window._global_config()
+    assert fast_config["search_strategy"] == "polar_hard"
+    assert fast_config["candidate_scoring"] == "polar"
+    assert fast_config["score_model"] == "polar_ring_ccf"
+    assert fast_config["reference_update"] == "fourier"
+    assert fast_config["top_l"] == 1
+    assert fast_config["proposal_angles_per_reference"] is None
+    assert fast_config["halfset_diagnostics"] is False
+    assert window._refine_config()["candidate_scoring"] == "fourier"
+    assert window._refine_config()["search_strategy"] == "quadratic_refine"
+    assert window._refine_config()["halfset_diagnostics"] is True
+    window.search_strategy.setCurrentIndex(window.search_strategy.findData("proposal"))
+    assert window.search_strategy.currentData() == "proposal"
+    assert window.candidate_scoring.currentData() == "fourier"
     window.apply_final_pose_to_raw.setChecked(True)
     assert not window._global_config()["apply_final_pose_to_raw"]
     assert window._refine_config()["apply_final_pose_to_raw"]

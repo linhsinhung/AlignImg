@@ -16,6 +16,7 @@ from tools.server_validation import (
     quadratic_refine_case,
     adaptive_rescue_case,
     classification_calibration,
+    fast3_case,
     fourier_native_conformance_case,
     fourier_mstep_workflow_ab_case,
     fourier_workflow_ab_case,
@@ -195,6 +196,17 @@ def test_cpu_quadratic_refine_server_contract():
         assert scenario["quadratic_median_shift_error_px"] < scenario[
             "adaptive_median_shift_error_px"
         ]
+
+
+def test_fast3_release_smoke_runs_all_workflows_on_cpu():
+    report = fast3_case("cpu", 8)
+    assert report["config"]["max_iterations"] == 3
+    assert report["config"]["apply_final_pose_to_raw"]
+    assert set(report["workflows"]) == {"k1", "fixed_mra", "reference_free"}
+    for workflow in report["workflows"].values():
+        assert workflow["deterministic_exact_match"]
+        assert workflow["iterations"] == 3
+        assert workflow["metadata"]["backend"] == "cpu"
 
 
 def test_cpu_adaptive_rescue_server_contract():

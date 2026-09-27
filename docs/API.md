@@ -47,6 +47,32 @@ Fourier-NCC reranking, and retains `top_l` normalized hypotheses. With
 shortlisted rotation. Reference-free
 and global workflows select this strategy when their config is omitted.
 
+`search_strategy="polar_hard"` is the explicit early-iteration throughput
+path. It evaluates complete angular polar-ring correlations at bounded
+translation centers, retains one deterministic winner, and therefore produces
+one-hot responsibilities. It requires `candidate_scoring="polar"`,
+`score_model="polar_ring_ccf"`, and `top_l=1`. Class priors are applied before
+winner selection: zero excludes a reference, one-hot priors fix class
+membership, and uniform priors permit reassignment across all references. The
+search remains global in angle while later iterations accumulate the winning
+translation center. This mode is intended for high- or moderate-SNR early
+reference-free/global alignment and repeated classification feedback. It is
+not a replacement for soft inference on ambiguous low-SNR data or for final
+continuous refinement.
+Two fixed-class quadratic iterations can improve shifts and reference
+coherence, but they are not guaranteed to restore balanced-soft accuracy after
+a fast-hard global pass. Validate the complete schedule against an external
+quality target for the data; use balanced global inference when that accuracy
+floor is required.
+
+`preset("fast3")` is the validated practical schedule for interactive
+classification/alignment feedback. It fixes `max_iterations=3`, selects the
+same polar-hard contract, disables fast-stage half-set diagnostics, and enables
+`apply_final_pose_to_raw`. It is intentionally a pure fast-only schedule; the
+GUI disables the refine stage while this preset is selected. The lower-level
+`preset("fast_hard")` remains available when callers need a custom iteration
+count or output policy.
+
 `search_strategy="adaptive_posterior"` is the prior-centered refinement path.
 For every particle it:
 
@@ -109,8 +135,33 @@ include CTF likelihood, or perform Fourier-regularized reconstruction. Inputs
 are expected to have been CTF-corrected externally.
 
 `AlignmentConfig.preset(name)` provides explicit `global_balanced`,
-`global_accurate`, `reference_free`, and `refine` configurations. Workflows use
-their matching preset only when `config` is omitted.
+`global_accurate`, `fast3`, `fast_hard`, `reference_free`, and `refine`
+configurations. Workflows use their matching preset only when `config` is
+omitted. `fast3` and `fast_hard` must be selected explicitly and default to
+`halfset_diagnostics=False`; neither changes the default workflow presets.
+
+## Three-layer alignment policy
+
+Use the modes as an explicit accuracy ladder rather than asking AlignImg to
+guess from the input:
+
+1. **Fast 3 exploration** — `preset("fast3")` for frequent early global or
+   reference-free classification feedback when a unique winner is plausible
+   and throughput matters. Review winner margins, occupancy, reassignment, pose
+   deltas, and reference change before proceeding. Use `preset("fast_hard")`
+   only when deliberately constructing a custom fast schedule.
+2. **Balanced soft** — `preset("global_balanced")` (or the workflow's existing
+   default) when class/pose ambiguity or low SNR makes posterior mass important.
+3. **Precise** — `preset("refine")` for the short final local pass, normally
+   with fixed one-hot class priors and half-set diagnostics enabled.
+
+Use Fast 3 for the repeated exploration loop, run balanced inference at
+meaningful checkpoints, and finish accuracy-sensitive output with the balanced
+workflow and optional local refinement. Do not automatically append two fixed
+quadratic iterations to Fast 3: the validated fixed-refine schedules did not
+reliably recover balanced-soft external accuracy. Switching layers is a caller
+or GUI decision; diagnostics are evidence only and never trigger automatic
+fallback, reselection, or extra iterations.
 
 ## Execution profiling (2.1 development)
 

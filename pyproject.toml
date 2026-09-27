@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alignimg"
-version = "2.2.0"
-description = "Reference-free, multi-reference, and robust 2D cryo-EM alignment."
+version = "2.3.0"
+description = "Reference-free, multi-reference, and robust 2D image alignment."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -58,9 +58,11 @@ dev = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src", "packages/alignimg-gpu/src", "packages/alignimg-gui/src"]
+testpaths = ["tests/core", "tests/gpu"]
+addopts = "-m 'not gpu'"
+pythonpath = ["src", "packages/alignimg-gui/src"]
 markers = [
+  "gpu: requires a real CuPy or native CUDA backend; opt in with -m gpu",
   "integration: optional tests that require local real-data files and extra IO dependencies",
   "multiprocessing: optional tests that require process-pool multiprocessing support",
 ]

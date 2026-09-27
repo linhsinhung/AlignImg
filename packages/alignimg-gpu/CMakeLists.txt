@@ -26,6 +26,7 @@ pybind11_add_module(
   _native
   MODULE
   src/alignimg_gpu/native/bindings.cpp
+  src/alignimg_gpu/native/polar_hard_cuda.cu
   src/alignimg_gpu/native/transform_cuda.cu
 )
 target_include_directories(_native PRIVATE src/alignimg_gpu/native)

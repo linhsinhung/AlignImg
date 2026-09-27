@@ -49,7 +49,10 @@ def source_manifest(root: Path = ROOT) -> dict:
             if path.is_file()
             and not path.is_symlink()
             and not any(
-                part in excluded or part.endswith(".egg-info") for part in path.parts
+                part in excluded
+                or part.startswith("._")
+                or part.endswith(".egg-info")
+                for part in path.parts
             )
             and (
                 path.name == "LICENSE"

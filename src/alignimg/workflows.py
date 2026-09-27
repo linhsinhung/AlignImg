@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import time
 from typing import Any
 
 import numpy as np
@@ -18,7 +19,10 @@ def available_alignment_backends() -> dict[str, dict[str, Any]]:
     """Return availability of CPU, native CUDA, and CuPy alignment engines."""
     gpu_available = importlib.util.find_spec("alignimg_gpu") is not None
     result = {
-        "cpu": {"available": True, "description": "CPU-authoritative soft Fourier engine."},
+        "cpu": {
+            "available": True,
+            "description": "CPU-authoritative soft Fourier engine.",
+        },
         "cuda": {"available": False, "description": "Native CUDA transform engine."},
         "cupy": {"available": False, "description": "CuPy fallback engine."},
     }
@@ -57,9 +61,19 @@ def _finalize_class_averages(
     config: AlignmentConfig,
     backend: str,
 ) -> AlignmentResult:
+    started = time.perf_counter()
+
+    def completed() -> AlignmentResult:
+        seconds = time.perf_counter() - started
+        result.metadata["final_raw_average_seconds"] = seconds
+        diagnostics = getattr(result, "diagnostics", None)
+        if diagnostics:
+            diagnostics[-1]["raw_average_seconds"] = seconds
+        return result
+
     result.metadata["class_average_estimator"] = "soft_posterior_reference"
     if not config.apply_final_pose_to_raw:
-        return result
+        return completed()
 
     values = np.asarray(images, dtype=np.float32)
     reference_count = len(result.references)
@@ -83,7 +97,7 @@ def _finalize_class_averages(
                 **metadata,
             }
         )
-        return result
+        return completed()
 
     sums = np.zeros((reference_count, *values.shape[1:]), dtype=np.float64)
     total_weights = np.zeros(reference_count, dtype=np.float64)
@@ -115,9 +129,9 @@ def _finalize_class_averages(
 
     averages = np.asarray(result.references, dtype=np.float32).copy()
     nonempty = total_weights > 1e-8
-    averages[nonempty] = (
-        sums[nonempty] / total_weights[nonempty, None, None]
-    ).astype(np.float32)
+    averages[nonempty] = (sums[nonempty] / total_weights[nonempty, None, None]).astype(
+        np.float32
+    )
     averages[nonempty] *= soft_circular_mask(
         values.shape[-1], config.mask_radius, config.mask_soft_edge
     )
@@ -130,7 +144,7 @@ def _finalize_class_averages(
             "class_average_empty_components": np.flatnonzero(~nonempty),
         }
     )
-    return result
+    return completed()
 
 
 def _dispatch(
@@ -160,8 +174,10 @@ def _dispatch(
         )
     if name == "auto":
         status = available_alignment_backends()
-        name = "cuda" if status["cuda"]["available"] else (
-            "cupy" if status["cupy"]["available"] else "cpu"
+        name = (
+            "cuda"
+            if status["cuda"]["available"]
+            else ("cupy" if status["cupy"]["available"] else "cpu")
         )
         if name == "cpu":
             return _finalize_class_averages(
@@ -287,8 +303,10 @@ def transform_images(
         return transform_stack(images, poses)
     if name == "auto":
         status = available_alignment_backends()
-        name = "cuda" if status["cuda"]["available"] else (
-            "cupy" if status["cupy"]["available"] else "cpu"
+        name = (
+            "cuda"
+            if status["cuda"]["available"]
+            else ("cupy" if status["cupy"]["available"] else "cpu")
         )
         if name == "cpu":
             return transform_stack(images, poses)

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alignimg-gui"
-version = "0.6.0"
-description = "PyQt6 development workbench for AlignImg 2D cryo-EM alignment."
+version = "0.7.0"
+description = "PyQt6 development workbench for AlignImg 2D image alignment."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{name = "Hsin-Hung Lin"}]
 dependencies = [
-  "alignimg>=2,<3",
+  "alignimg>=2.3.0,<3",
   "mrcfile>=1.5",
   "numpy",
   "PyQt6>=6.6",

@@ -520,6 +520,7 @@ def test_adaptive_config_rejects_invalid_values(changes, message):
         adaptive_config(**changes).normalized(workflow="refine")
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_adaptive_backend_parity_when_gpu_is_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:

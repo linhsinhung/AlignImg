@@ -7,13 +7,13 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "alignimg-gpu"
-version = "2.2.0"
+version = "2.3.0"
 description = "Optional single-NVIDIA-GPU backend for AlignImg 2.x"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE", "GPL-3.0.txt", "THIRD_PARTY_NOTICES.md"]
-dependencies = ["alignimg>=2.2.0,<3", "numpy"]
+dependencies = ["alignimg>=2.3.0,<3", "numpy"]
 
 [project.optional-dependencies]
 cuda12 = ["cupy-cuda12x>=14"]

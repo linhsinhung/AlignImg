@@ -358,6 +358,7 @@ def test_corrective_quadratic_priors_remain_soft_and_normalized():
     assert np.all(result.diagnostics[0]["effective_component_weight"] > 0.0)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_quadratic_backend_pose_parity_when_gpu_is_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:

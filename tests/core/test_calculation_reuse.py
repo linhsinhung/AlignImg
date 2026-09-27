@@ -80,7 +80,14 @@ def test_reuse_matches_uncached_scores_and_multi_iteration_updates(
         np.testing.assert_array_equal(reused[name], plain[name], err_msg=name)
 
 
-@pytest.mark.parametrize("backend", ["cpu", "cuda", "cupy"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.gpu),
+        pytest.param("cupy", marks=pytest.mark.gpu),
+    ],
+)
 def test_reuse_reduces_fft_and_norm_work(backend):
     if not ai.available_alignment_backends()[backend]["available"]:
         pytest.skip(f"{backend} unavailable")
@@ -112,6 +119,7 @@ def test_frequency_build_counter_counts_actual_rebuilds():
         _ACTIVE.reset(token)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cuda", "cupy"])
 def test_gpu_workspace_reuses_scoring_and_update_fft_across_complete_workflow(backend):
     if not ai.available_alignment_backends()[backend]["available"]:
@@ -127,7 +135,9 @@ def test_gpu_workspace_reuses_scoring_and_update_fft_across_complete_workflow(ba
         assert counts["workspace_scoring_cache_uploads"] == 1
         assert counts["workspace_scoring_cache_hits"] == 1
         assert counts["workspace_update_cache_uploads"] == 1
-        assert counts["workspace_update_cache_hits"] == 5
+        # The shared M-step performs one update request per iteration instead
+        # of separate full, half-A, and half-B update requests.
+        assert counts["workspace_update_cache_hits"] == 1
         assert counts["workspace_release_calls"] == 1
         assert workspace["closed"]
         assert workspace["roles"]["scoring"]["policy"] == "device"

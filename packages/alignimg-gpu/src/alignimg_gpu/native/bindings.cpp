@@ -1,4 +1,5 @@
 #include "transform_cuda.hpp"
+#include "polar_hard_cuda.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -11,7 +12,31 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "AlignImg native CUDA primitives";
-    module.attr("__version__") = "2.2.0";
+    module.attr("__version__") = "2.3.0";
+    py::class_<alignimg_gpu::PolarHardSession>(module, "PolarHardSession")
+        .def(
+            py::init<int, int, int, int>(),
+            py::arg("device_id"), py::arg("image_size"),
+            py::arg("angle_samples"), py::arg("radial_bins")
+        )
+        .def(
+            "sample_device",
+            &alignimg_gpu::PolarHardSession::sample_device,
+            py::arg("input_ptr"), py::arg("image_indices_ptr"),
+            py::arg("centers_y_ptr"), py::arg("centers_x_ptr"),
+            py::arg("mirrors_ptr"), py::arg("offsets_y_ptr"),
+            py::arg("offsets_x_ptr"), py::arg("output_ptr"),
+            py::arg("source_count"), py::arg("count"),
+            py::arg("stream_ptr")
+        )
+        .def(
+            "angular_peak_device",
+            &alignimg_gpu::PolarHardSession::angular_peak_device,
+            py::arg("curves_ptr"), py::arg("peak_ptr"),
+            py::arg("offset_ptr"), py::arg("score_ptr"),
+            py::arg("accepted_ptr"), py::arg("count"),
+            py::arg("stream_ptr")
+        );
     py::class_<alignimg_gpu::TransformSession>(module, "TransformSession")
         .def(py::init<int, int>(), py::arg("device_id"), py::arg("image_size"))
         .def(

@@ -1,17 +1,23 @@
 # AlignImg Workbench
 
-AlignImg Workbench 0.6 is a development GUI for the AlignImg 2.x 2D cryo-EM
+AlignImg Workbench 0.7 is a development GUI for the AlignImg 2.3 2D image
 alignment library. It keeps PyQt out of the core package and runs each
 alignment in an isolated worker process.
 
 ## Install
 
-Install AlignImg first, then install the GUI package:
+From the repository root, install AlignImg first, then the GUI package:
 
 ```bash
-python -m pip install -e .
-python -m pip install -e packages/alignimg-gui
+python -m pip install .
+python -m pip install ./packages/alignimg-gui
 ```
+
+The GUI installs `mrcfile`, PyQt6, and pyqtgraph as dependencies and requires a
+graphical desktop. The core stays independent of these GUI dependencies.
+For editable development installs or upgrades in an existing environment, see
+the [installation guide](../../docs/INSTALLATION.md). Workbench module and
+distribution versions should both be `0.7.0`, with core `2.3.0`.
 
 The optional `alignimg-gpu` package supplies native CUDA and CuPy backends.
 The GUI remains usable with the CPU backend when it is absent.
@@ -49,10 +55,18 @@ Result NPZ files written by AlignImg 1.5 and later record their integer-origin c
 convention. Older files without that field are treated as 1.4 geometric-center
 poses and converted when used as refinement input.
 
-Workbench 0.6 separates the global pose-search selector from the refinement
-selector. Global alignment defaults to polar proposal; refinement defaults to
-continuous quadratic search, while adaptive posterior remains available as a
-2.1 compatibility choice. It also exposes
+Workbench 0.7 provides two explicit pipeline strategies. **Balanced + precise**
+remains the default. **Fast 3 exploration** runs the validated three-iteration
+polar-hard schedule, reconstructs final averages from raw particles, and
+disables local refinement; it is intended for repeated classification/alignment
+feedback rather than final accuracy-sensitive output. It is never selected
+from the input or data size. The advanced global selector retains **Fast hard
+(custom)** for deliberately configured schedules.
+
+The refinement selector defaults to continuous quadratic search, while
+adaptive posterior remains available as a 2.1 compatibility choice. Appending
+two fixed-class refine iterations to a fast-hard pass is not an automatic
+guarantee that balanced-soft accuracy will be recovered. The workbench also exposes
 Fourier/raster candidate scoring, uniform/whitened Fourier NCC, and
 Fourier/spatial reference updates. The run summary records the actual backend,
 FFT policy, rescue statistics, and GPU memory plans.

@@ -3,8 +3,21 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 build/
 dist/
+*.so
+*.pyd
+
+# Local virtual environments
+/.venv/
+/venv/
+
+# Test coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # Local data and generated example outputs
 /Reference/
@@ -20,5 +33,13 @@ realdata_*/
 accuracy_report*/
 minimal_report*/
 
+# Reports / handoffs copied into the checkout root
+/alignimg-validation-*.json
+/alignimg-validation-*.json.tmp
+/alignimg*-server-handoff*.tar.gz
+/alignimg*-server-handoff*.tar.gz.sha256
+
 # OS/editor noise
 .DS_Store
+._*
+__MACOSX/

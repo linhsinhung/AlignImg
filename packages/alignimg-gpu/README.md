@@ -1,6 +1,6 @@
 # alignimg-gpu
 
-Optional native-CUDA and CuPy backends for AlignImg 2.x. The native path uses a
+Optional native-CUDA and CuPy backends for AlignImg 2.3. The native path uses a
 compiled persistent CUDA transform session and a fused Fourier M-step;
 FFT, NCC reduction, controller stages, and final raw-output accumulation use
 CuPy. The workflow controller
@@ -14,20 +14,39 @@ posterior rather than only the public top-L shortlist.
 Both GPU transform paths accept even-sized square
 images and rotate/mirror about the integer origin `(size//2, size//2)`.
 
-Install the matching wheel extra:
+## Installation
+
+From the repository root, install the core first, then build the GPU package
+with the extra matching your CUDA runtime:
 
 ```bash
-python -m pip install -e './packages/alignimg-gpu[cuda12]'
-# or: python -m pip install -e './packages/alignimg-gpu[cuda13]'
+python -m pip install .
+python -m pip install -v './packages/alignimg-gpu[cuda12]'
+# CUDA 13 alternative: './packages/alignimg-gpu[cuda13]'
 ```
 
-On Linux with `nvcc`, the build compiles `_native`; without a CUDA compiler it
-installs the CuPy-only fallback. For the RTX 3090 server, build with:
+These are source builds, not downloads of a prebuilt CUDA wheel. Both GPU
+backends require Linux x86-64, CuPy 14+, and a compatible NVIDIA driver. Install
+only one CuPy distribution in an environment. Native compilation additionally
+requires CUDA Toolkit 12+, C++17, and CMake 3.24+; pip manages the Python build
+dependencies during a normal isolated build.
+
+With `nvcc`, the build compiles `_native`; without it, only the CuPy fallback is
+installed. For example, explicitly target an RTX 3090:
 
 ```bash
+CUDACXX=/usr/local/cuda/bin/nvcc \
 CMAKE_ARGS='-DCMAKE_CUDA_ARCHITECTURES=86' \
   python -m pip install -v './packages/alignimg-gpu[cuda12]'
 ```
+
+Adjust the path and architecture for your host. See the
+[installation guide](../../docs/INSTALLATION.md) for explicit fallback builds,
+in-place upgrades, and package/native version checks. Rebuilding the native
+extension is required when upgrading its sources or version stamp; an editable
+Python installation alone does not refresh an already compiled binary.
+
+## Backend selection and execution
 
 Use `backend="cuda"` to require the native engine, `backend="cupy"` to require
 the fallback, or `backend="auto"` for CUDA → CuPy → CPU selection. Explicit
@@ -47,11 +66,19 @@ complex weighted accumulation, and one output IFFT per reference. Spatial
 reference update and raster candidate scoring remain explicit frozen comparison
 paths.
 
-The 2.2 refinement preset uses bounded Fourier correlation maps followed by
+The quadratic refinement preset uses bounded Fourier correlation maps followed by
 continuous independent x/y and angular quadratic fitting. Native CUDA performs
 bounded-window peak selection and fitting without downloading correlation maps;
 CuPy provides the portable GPU implementation. Correlation-map chunks obey the
 same VRAM budget and are recorded in result metadata.
+
+AlignImg 2.3 adds the opt-in `fast3` and configurable `fast_hard` presets. The
+native polar path samples bounded translation centers and selects angular peaks
+on the GPU, using CuPy batched angular FFT/IFFT. Only final winners, scores, and
+margins return to the host; full correlation maps stay on the device. The same
+Fourier reference updater and final raw-average accumulator serve hard and soft
+inference. `fast3` runs three iterations and enables final raw reconstruction.
+The core, GPU package, and native build stamp must all be `2.3.0`.
 
 When `apply_final_pose_to_raw=True`, the input NumPy stack is still streamed to
 the selected GPU backend in VRAM-bounded batches. Final-pose transforms and

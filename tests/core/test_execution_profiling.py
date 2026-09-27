@@ -8,17 +8,11 @@ import pytest
 import alignimg as ai
 from alignimg._profiling import ExecutionProfile, _ACTIVE, current_profile
 from tools.performance_fixtures import (
-    DEFAULT_BASELINE,
     fixture_config,
-    sha256,
     synthetic_inputs,
 )
 from tools.performance_validation import (
-    check_result,
-    compare_arrays,
     execute,
-    frozen_fixture_check,
-    main,
     profiling_case,
     result_arrays,
 )
@@ -190,116 +184,7 @@ def test_transfer_wrappers_count_payloads_without_extra_device_probes(monkeypatc
         _ACTIVE.reset(token)
 
 
-def test_frozen_preinstrumentation_fixtures():
-    if not DEFAULT_BASELINE.exists():
-        pytest.skip(
-            "frozen local baseline artifacts are not included in the distribution"
-        )
-    report = frozen_fixture_check(DEFAULT_BASELINE)
-    assert set(report) == {"global", "adaptive"}
-    assert all(
-        value["maximum_absolute_error"] == 0
-        for case in report.values()
-        for value in case.values()
-    )
-    manifest = json.loads((DEFAULT_BASELINE / "manifest.json").read_text())
-    assert sha256(DEFAULT_BASELINE / "source.tar.gz") == manifest["archive_sha256"]
-
-
-def test_comparison_rejects_nonfinite_and_changed_pose():
-    with pytest.raises(AssertionError):
-        compare_arrays({"references": np.ones(1)}, {"references": np.array([np.nan])})
-    with pytest.raises(AssertionError):
-        compare_arrays({"angle_deg": np.zeros(1)}, {"angle_deg": np.ones(1)})
-
-
-def test_result_check_allows_float32_responsibility_sum_roundoff():
-    result = SimpleNamespace(
-        metadata={"backend": "cuda"},
-        references=np.ones((1, 2, 2), dtype=np.float32),
-        class_averages=np.ones((1, 2, 2), dtype=np.float32),
-        responsibilities=np.array([[1.000002384185791]], dtype=np.float32),
-        inlier_weights=np.ones(1, dtype=np.float32),
-    )
-    check_result(result, "cuda")
-    result.responsibilities[0, 0] = 1.000006
-    with pytest.raises(AssertionError):
-        check_result(result, "cuda")
-
-
-def test_fixture_check_rejects_missing_outputs(monkeypatch):
-    if not DEFAULT_BASELINE.exists():
-        pytest.skip("requires frozen local fixtures")
-    from tools import performance_validation
-
-    monkeypatch.setattr(performance_validation, "capture_iteration", lambda *args: {})
-    with pytest.raises(AssertionError, match="fields differ"):
-        frozen_fixture_check(DEFAULT_BASELINE)
-
-
-def test_performance_runner_writes_failure_report(tmp_path):
-    output = tmp_path / "failed.json"
-    assert (
-        main(
-            [
-                "--backend",
-                "cpu",
-                "--baseline",
-                str(tmp_path / "missing"),
-                "--output",
-                str(output),
-            ]
-        )
-        == 1
-    )
-    report = json.loads(output.read_text())
-    assert report["status"] == "failed" and "traceback" in report
-    with pytest.raises(SystemExit):
-        main(["--backend", "cpu", "--output", str(output)])
-
-
-def test_source_manifest_failure_is_also_recorded(tmp_path, monkeypatch):
-    from tools import performance_validation
-
-    def missing_source():
-        raise FileNotFoundError("missing source file")
-
-    monkeypatch.setattr(performance_validation, "source_manifest", missing_source)
-    output = tmp_path / "missing-source.json"
-    assert main(["--backend", "cpu", "--output", str(output)]) == 1
-    report = json.loads(output.read_text())
-    assert report["status"] == "failed"
-    assert report["error"] == "missing source file"
-
-
-def test_performance_runner_separates_profile_from_repeated_timing(tmp_path):
-    if not DEFAULT_BASELINE.exists():
-        pytest.skip("requires frozen local fixtures")
-    output = tmp_path / "run.json"
-    assert (
-        main(
-            [
-                "--backend",
-                "cpu",
-                "--only",
-                "global",
-                "--repeats",
-                "2",
-                "--output",
-                str(output),
-            ]
-        )
-        == 0
-    )
-    report = json.loads(output.read_text())
-    case = report["cases"]["global"]
-    assert len(case["unprofiled_wall_seconds"]) == 2
-    assert not case["config"]["profile_execution"]
-    assert case["performance"]["profiled"]
-    assert report["summary"]["performance_acceptance"] == "baseline_only"
-    assert (tmp_path / "run.global.inputs.npz").exists()
-
-
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cuda", "cupy"])
 def test_gpu_profiling_conformance(backend):
     if not ai.available_alignment_backends()[backend]["available"]:

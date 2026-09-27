@@ -1,11 +1,17 @@
 # AlignImg
 
-**2-D cryo-EM particle alignment with reference-free initialization,
+**2-D image alignment with reference-free initialization,
 multi-reference alignment, and continuous pose refinement.**
 
-AlignImg 2.2 estimates in-plane rotations and translations, then reconstructs
+AlignImg 2.3 estimates in-plane rotations and translations, then reconstructs
 reference/class-average images. Its Python API can be used before or between
 steps of an external classification workflow.
+
+The library is general-purpose within its even-square 2-D image contract;
+cryo-EM provides the principal validation datasets. Fast 3 supports frequent
+classification/alignment feedback, while balanced inference supports quality
+checkpoints and final convergence. Release scope and evidence are recorded in
+[the 2.3 release freeze](docs/RELEASE_FREEZE_2_3.md).
 
 AlignImg was developed by studying the alignment concepts, published methods,
 and practical workflows established by EMAN2 and RELION. With AI-assisted
@@ -40,6 +46,8 @@ Class priors can fix each particle to one reference or allow reassignment.
 
 Additional capabilities include:
 
+- Explicit Fast 3 exploration, balanced-soft, and precise alignment modes;
+  existing workflows keep their balanced defaults unless Fast 3 is selected.
 - Subpixel/subdegree refinement using quadratic peak fitting.
 - Soft class responsibilities, pose candidates, uncertainty, and robust inlier weights.
 - Optional mirror search, disabled by default.
@@ -56,25 +64,15 @@ alignment components; they are not a validated biological classification.
 
 ### Requirements
 
-- **Python 3.10 or newer**; Python 3.12 is a tested choice.
-- **CPU:** NumPy, SciPy, and OpenCV headless, installed automatically.
-- **MRC/MRCS input/output:** `mrcfile`, included by the optional `[io]` extra.
-- **GPU:** Linux x86-64, a single NVIDIA CUDA GPU, a compatible NVIDIA driver,
-  and CuPy 14 or newer. Both AlignImg GPU backends currently require Linux
-  x86-64; use the CPU backend on other platforms.
-- **Native CUDA build:** CUDA Toolkit 12 or newer with `nvcc`, a compatible
-  C++17 host compiler, and CMake 3.24 or newer. The build uses scikit-build-core
-  and pybind11; pip manages the Python build dependencies.
+- Python **3.10+**; NumPy, SciPy, and OpenCV headless install with the core.
+- Optional MRC/MRCS I/O: the core `[io]` extra.
+- Optional GPU: Linux x86-64, one NVIDIA GPU, a compatible driver, and CuPy 14+.
+  Native CUDA additionally requires CUDA Toolkit 12+, `nvcc`, and a C++17 compiler.
+- Optional GUI: PyQt6, pyqtgraph, and a graphical desktop.
 
-The 2.2 release was tested on Linux x86-64 with Python 3.12, an RTX 3090
-(24 GB), CUDA Toolkit 12.8, and CuPy 14.2.0. This is a tested configuration,
-not a minimum GPU-memory requirement. Host RAM must accommodate the particle
-array and working copies; GPU batching does not provide disk streaming.
+### Install from source
 
-### 1. Install the CPU package
-
-Clone the repository or download and extract its source archive. Run the
-installation commands from the repository root:
+From a clone or extracted source checkout:
 
 ```bash
 git clone https://github.com/linhsinhung/AlignImg.git
@@ -86,56 +84,34 @@ python -m pip install --upgrade pip
 python -m pip install ".[io]"
 ```
 
-The activation command above is for a POSIX shell. An existing Conda environment
-also works. Use `python -m pip install .` if you only need the NumPy-array API,
-or `python -m pip install -e ".[io]"` for an editable development installation.
+If you already have a Conda or virtual environment, skip creation of `.venv`.
+Use `python -m pip install .` for the NumPy-array API without MRC I/O.
+The core does not install GPU or GUI dependencies.
 
-The CPU package does not install CUDA, CuPy, or GUI dependencies.
+### Optional GPU and GUI
 
-### 2. Optionally install GPU support
-
-Install the CPU package first, then choose one of the following paths.
-
-**Native CUDA**
-
-With CUDA 12.x and `nvcc` discoverable on the build host:
+Run from the repository root after installing the core. For a CUDA 12 host with
+`nvcc` discoverable:
 
 ```bash
 python -m pip install -v "./packages/alignimg-gpu[cuda12]"
 ```
 
-On CUDA 13.x, use `[cuda13]` instead. Select the extra for the CUDA
-toolkit/runtime you intend to use, not just the maximum CUDA version displayed
-by `nvidia-smi`. Install only one CuPy distribution in an environment; see the
-[CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
-
-By default, native compilation targets the build machine's GPU. To specify
-the compiler and architecture explicitly, for example for an RTX 3090:
+For the GUI:
 
 ```bash
-CUDACXX=/usr/local/cuda/bin/nvcc \
-CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=86" \
-python -m pip install -v "./packages/alignimg-gpu[cuda12]"
+python -m pip install ./packages/alignimg-gui
+alignimg-gui
 ```
 
-Adjust the compiler path and architecture for your host. Without a discoverable
-CUDA compiler, the package builds only the CuPy fallback.
+Use `[cuda13]` for a CUDA 13 runtime. Without `nvcc`, the GPU package builds the
+CuPy-only fallback; it does not provide the native `cuda` backend. See the
+[installation guide](docs/INSTALLATION.md) for compiler/architecture selection,
+explicit fallback builds, version verification, development installs, and
+upgrading an existing server in place. These commands install from source;
+they do not assume published PyPI packages or a release tag.
 
-**CuPy fallback without compiling the native extension**
-
-To explicitly skip the native CUDA build:
-
-```bash
-CMAKE_ARGS="-DCMAKE_CUDA_COMPILER=NOTFOUND" \
-python -m pip install "./packages/alignimg-gpu[cuda12]"
-```
-
-This still requires a working CuPy CUDA runtime and NVIDIA driver. It uses
-CuPy's runtime-compiled kernels. The package build still configures CMake and
-a host C++ compiler. See the [GPU package guide](packages/alignimg-gpu/README.md)
-for execution and memory details.
-
-### 3. Check the installation and select a backend
+### Check the installation and select a backend
 
 ```python
 import alignimg as ai
@@ -258,6 +234,21 @@ pose, screened at 1° intervals, and translations within ±3 pixels. It fits
 continuous peak positions and verifies them with Fourier NCC plus pose priors.
 Refinement needs an initial alignment within a useful local neighborhood.
 The example iteration counts are starting points, not convergence guarantees.
+
+For repeated classification/alignment feedback, callers may explicitly use
+`AlignmentConfig.preset("fast3")`. It runs three deterministic top-1 polar-ring
+iterations and reconstructs the final class averages from the raw particles.
+On the frozen 3,050-particle K=1 workload it reached raw correlation `0.948872`
+in `7.514 s`, a `2.485x` wall speedup over balanced 12. This is a practical
+exploration preset, not a general K>1 or low-SNR accuracy guarantee.
+
+`AlignmentConfig.preset("fast_hard")` remains the configurable low-level fast
+preset. Appending fixed quadratic iterations does not guarantee recovery of
+balanced-soft accuracy. Neither fast preset is selected automatically; use the
+balanced workflow default for checkpoints, final convergence, low SNR, class
+ambiguity, or an external accuracy floor. See the
+[API guide](docs/API.md#three-layer-alignment-policy) for the mode contract and
+review diagnostics.
 
 ## Other alignment workflows
 
@@ -400,6 +391,10 @@ poses. The integer center matches RELION's center convention, but external pose
 formats may still need angle/sign/translation conversion. Legacy pose adapters
 are documented in the [API guide](docs/API.md).
 
+Downstream applications own data conversion, particle ordering, pose composition,
+and workflow orchestration. See the [integration guide](docs/DOWNSTREAM_INTEGRATION_2_3.zh-TW.md)
+for these contracts and RE2DC handoff notes.
+
 ## Optional GUI
 
 [AlignImg Workbench](packages/alignimg-gui/README.md) provides MRC-stack input,
@@ -462,18 +457,25 @@ details are documented in the [third-party notices](THIRD_PARTY_NOTICES.md), the
 ## Documentation and validation
 
 - [Public API and configuration](docs/API.md)
+- [Installation and in-place upgrades](docs/INSTALLATION.md)
 - [Acknowledgements and source lineage](docs/PROVENANCE.md)
 - [Unified alignment model](docs/UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md) (Traditional Chinese)
 - [Continuous quadratic refinement](docs/CONTINUOUS_QUADRATIC_REFINEMENT_2_2.md)
 - [GPU installation and execution](packages/alignimg-gpu/README.md)
-- [2.2 release and validation summary](docs/RELEASE_FREEZE_2_2.md)
+- [2.3 release scope and validation status](docs/RELEASE_FREEZE_2_3.md)
 
-For development tests:
+For the daily CPU regression suite (core alignment and GPU-backend emulation,
+without real GPU hardware or private validation datasets):
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest
+python -m pytest -q
 ```
+
+The [test-suite guide](tests/README.zh-TW.md) describes the groups, optional
+dependencies, real-GPU and complete-suite commands, and historical experiments.
+Historical release gates remain available, but do not determine acceptance of
+current default workflows.
 
 For a backend smoke report from the source checkout:
 

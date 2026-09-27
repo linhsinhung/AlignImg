@@ -176,6 +176,7 @@ def test_cpu_fourier_mstep_matches_spatial_workflow_and_keeps_diagnostics():
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_gpu_fourier_mstep_matches_cpu_when_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:

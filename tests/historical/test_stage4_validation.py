@@ -7,7 +7,7 @@ from pathlib import Path
 from tools.stage4_validation import unpack_baseline, validate_shared_mstep_contract
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_stage4_frozen_dev5_baseline_is_available(tmp_path: Path):

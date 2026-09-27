@@ -75,6 +75,30 @@ class AlignmentConfig:
                 temperature_start=0.08,
                 temperature_end=0.05,
             ),
+            "fast_hard": dict(
+                search_strategy="polar_hard",
+                candidate_scoring="polar",
+                score_model="polar_ring_ccf",
+                reference_update="fourier",
+                top_l=1,
+                proposal_angles_per_reference=None,
+                temperature_start=0.08,
+                temperature_end=0.05,
+                halfset_diagnostics=False,
+            ),
+            "fast3": dict(
+                max_iterations=3,
+                search_strategy="polar_hard",
+                candidate_scoring="polar",
+                score_model="polar_ring_ccf",
+                reference_update="fourier",
+                top_l=1,
+                proposal_angles_per_reference=None,
+                temperature_start=0.08,
+                temperature_end=0.05,
+                halfset_diagnostics=False,
+                apply_final_pose_to_raw=True,
+            ),
             "reference_free": dict(
                 search_strategy="proposal",
                 top_l=4,
@@ -114,14 +138,17 @@ class AlignmentConfig:
             "proposal",
             "adaptive_posterior",
             "quadratic_refine",
+            "polar_hard",
         }:
             raise ValueError(
                 "search_strategy must be 'proposal', 'adaptive_posterior', "
-                "or 'quadratic_refine'."
+                "'quadratic_refine', or 'polar_hard'."
             )
         values["candidate_scoring"] = str(values["candidate_scoring"]).strip().lower()
-        if values["candidate_scoring"] not in {"raster", "fourier"}:
-            raise ValueError("candidate_scoring must be 'raster' or 'fourier'.")
+        if values["candidate_scoring"] not in {"raster", "fourier", "polar"}:
+            raise ValueError(
+                "candidate_scoring must be 'raster', 'fourier', or 'polar'."
+            )
         if (
             values["search_strategy"] == "quadratic_refine"
             and values["candidate_scoring"] != "fourier"
@@ -136,9 +163,53 @@ class AlignmentConfig:
         if values["score_model"] not in {
             "fourier_ncc",
             "whitened_fourier_ncc",
+            "polar_ring_ccf",
         }:
             raise ValueError(
-                "score_model must be 'fourier_ncc' or 'whitened_fourier_ncc'."
+                "score_model must be 'fourier_ncc', 'whitened_fourier_ncc', "
+                "or 'polar_ring_ccf'."
+            )
+        if values["search_strategy"] == "polar_hard":
+            if values["candidate_scoring"] != "polar":
+                raise ValueError("polar_hard requires candidate_scoring='polar'.")
+            if values["score_model"] != "polar_ring_ccf":
+                raise ValueError("polar_hard requires score_model='polar_ring_ccf'.")
+            if values["top_l"] != 1:
+                raise ValueError("polar_hard requires top_l=1.")
+            defaults = AlignmentConfig()
+            ignored = []
+            if values["proposal_angles_per_reference"] is not None:
+                ignored.append("proposal_angles_per_reference")
+            if float(values["adaptive_fraction"]) != defaults.adaptive_fraction:
+                ignored.append("adaptive_fraction")
+            if int(values["oversampling_order"]) != defaults.oversampling_order:
+                ignored.append("oversampling_order")
+            if values["max_adaptive_cells"] is not None:
+                ignored.append("max_adaptive_cells")
+            if values["rescue_uncertain_particles"]:
+                ignored.append("rescue_uncertain_particles")
+            if values["rescue_normalized_entropy_threshold"] is not None:
+                ignored.append("rescue_normalized_entropy_threshold")
+            if values["rescue_map_posterior_threshold"] is not None:
+                ignored.append("rescue_map_posterior_threshold")
+            if float(values["rescue_max_fraction"]) != defaults.rescue_max_fraction:
+                ignored.append("rescue_max_fraction")
+            if (
+                float(values["rescue_min_score_improvement"])
+                != defaults.rescue_min_score_improvement
+            ):
+                ignored.append("rescue_min_score_improvement")
+            if ignored:
+                raise ValueError(
+                    "polar_hard does not use non-default " + ", ".join(ignored) + "."
+                )
+        elif (
+            values["candidate_scoring"] == "polar"
+            or values["score_model"] == "polar_ring_ccf"
+        ):
+            raise ValueError(
+                "candidate_scoring='polar' and score_model='polar_ring_ccf' "
+                "require search_strategy='polar_hard'."
             )
         values["reference_update"] = str(values["reference_update"]).strip().lower()
         if values["reference_update"] not in {"spatial", "fourier"}:
@@ -232,7 +303,10 @@ class AlignmentConfig:
         if values["batch_size"] is not None and int(values["batch_size"]) < 1:
             raise ValueError("batch_size must be positive when provided.")
         # Profiling is observational and must not change default-refine selection.
-        if workflow == "refine" and replace(self, profile_execution=False) == AlignmentConfig():
+        if (
+            workflow == "refine"
+            and replace(self, profile_execution=False) == AlignmentConfig()
+        ):
             values["max_iterations"] = 5
             values["robust_weighting"] = True
         return AlignmentConfig(**values)
@@ -307,6 +381,8 @@ class AlignmentResult:
     _class_average_values: np.ndarray | None = field(default=None, repr=False)
     _pose_entropy_values: np.ndarray | None = field(default=None, repr=False)
     _map_posterior_values: np.ndarray | None = field(default=None, repr=False)
+    _polar_raw_shift_y_values: np.ndarray | None = field(default=None, repr=False)
+    _polar_raw_shift_x_values: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def class_averages(self) -> np.ndarray:

@@ -1,7 +1,7 @@
 """Optional real-data integration test for the public API.
 
 Run with:
-    RUN_ALIGNIMG_INTEGRATION=1 python -m pytest -m integration
+    RUN_ALIGNIMG_INTEGRATION=1 python -m pytest tests/integration -m integration
 """
 
 from __future__ import annotations

@@ -33,8 +33,19 @@ from alignimg._fourier import (
     soft_circular_mask,
 )
 from alignimg._geometry import mirror_x_integer_origin, validate_even_square
+from alignimg._polar_hard import (
+    polar_offsets as _polar_offsets,
+    polar_radius,
+    translation_center_grid,
+)
 from alignimg.models import AlignmentConfig, AlignmentResult, PoseSet
-from alignimg._profiling import count as profile_count, current_profile, profile_call, profile_scope, profile_stage
+from alignimg._profiling import (
+    count as profile_count,
+    current_profile,
+    profile_call,
+    profile_scope,
+    profile_stage,
+)
 
 from .memory import MemoryPlan, plan_batch_size
 from ._workspace import WorkflowGpuWorkspace
@@ -43,6 +54,7 @@ from ._workspace import WorkflowGpuWorkspace
 def _asdevice(values, **kwargs):
     # Callers already validate CUDA; do not add a device probe per conversion.
     import cupy as cp
+
     if current_profile() is None or isinstance(values, cp.ndarray):
         return cp.asarray(values, **kwargs)
     with profile_scope("host_to_device", cuda=True):
@@ -54,6 +66,7 @@ def _asdevice(values, **kwargs):
 
 def _ashost(values):
     import cupy as cp
+
     if current_profile() is None:
         return cp.asnumpy(values)
     with profile_scope("device_to_host", cuda=True):
@@ -104,6 +117,64 @@ void transform_bilinear_wrap(
     const float top = source[y0 * size + x0] * (1.0f - wx) + source[y0 * size + x1] * wx;
     const float bottom = source[y1 * size + x0] * (1.0f - wx) + source[y1 * size + x1] * wx;
     output[index] = top * (1.0f - wy) + bottom * wy;
+}
+"""
+
+
+_POLAR_SAMPLE_KERNEL = r"""
+extern "C" __global__
+void polar_sample_quantized(
+    const float* images, const int* image_indices,
+    const double* centers_y, const double* centers_x,
+    const unsigned char* mirrors,
+    const double* offsets_y, const double* offsets_x,
+    float* output, const int source_count, const int count,
+    const int size, const int angle_samples, const int radial_bins)
+{
+    const long long index =
+        (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    const long long ring_pixels = (long long)angle_samples * radial_bins;
+    if (index >= (long long)count * ring_pixels) return;
+    const int item = (int)(index / ring_pixels);
+    const int polar_index = (int)(index - (long long)item * ring_pixels);
+    const int source_index = image_indices[item];
+    if (source_index < 0 || source_index >= source_count) {
+        output[index] = 0.0;
+        return;
+    }
+    const double origin = (double)(size / 2);
+    double source_y = origin + centers_y[item] + offsets_y[polar_index];
+    double source_x = origin + centers_x[item] + offsets_x[polar_index];
+    if (mirrors[item]) source_x = 2.0 * origin - source_x;
+
+    // The CPU authority explicitly uses the same 5-bit bilinear table instead
+    // of version-dependent cv::warpPolar coordinate generation.
+    const int quantized_y = (int)floor(source_y * 32.0 + 0.5);
+    const int quantized_x = (int)floor(source_x * 32.0 + 0.5);
+    const int y0 = quantized_y >> 5;
+    const int x0 = quantized_x >> 5;
+    if (y0 < 0 || x0 < 0 || y0 >= size || x0 >= size) {
+        output[index] = 0.0;
+        return;
+    }
+    const int y1 = min(y0 + 1, size - 1);
+    const int x1 = min(x0 + 1, size - 1);
+    const float wy = (float)(quantized_y & 31) * (1.0f / 32.0f);
+    const float wx = (float)(quantized_x & 31) * (1.0f / 32.0f);
+    const float* source = images + (long long)source_index * size * size;
+    // Match NumPy's separately rounded float32 multiply/add authority. CUDA
+    // otherwise contracts these expressions into FMAs, which moves the fitted
+    // angle enough to violate the frozen shift tolerance on 128px inputs.
+    const float one_minus_wx = __fsub_rn(1.0f, wx);
+    const float one_minus_wy = __fsub_rn(1.0f, wy);
+    const float top = __fadd_rn(
+        __fmul_rn(source[y0 * size + x0], one_minus_wx),
+        __fmul_rn(source[y0 * size + x1], wx));
+    const float bottom = __fadd_rn(
+        __fmul_rn(source[y1 * size + x0], one_minus_wx),
+        __fmul_rn(source[y1 * size + x1], wx));
+    output[index] = __fadd_rn(
+        __fmul_rn(top, one_minus_wy), __fmul_rn(bottom, wy));
 }
 """
 
@@ -226,9 +297,9 @@ def backend_status() -> dict[str, dict[str, object]]:
         "cuda": {
             "available": native is not None and cupy_available,
             "description": "Native CUDA indexed Fourier scoring and fused FP64 M-step accumulation with a CuPy controller.",
-            "error": None
-            if native is not None
-            else "native CUDA extension is not installed",
+            "error": (
+                None if native is not None else "native CUDA extension is not installed"
+            ),
         },
         "cupy": {
             "available": cupy_available,
@@ -377,6 +448,7 @@ def _transform_batch_cupy(images, angles, shifts_y, shifts_x, mirrors):
 
 
 _NATIVE_SESSIONS: dict[tuple[int, int], object] = {}
+_POLAR_NATIVE_SESSIONS: dict[tuple[int, int, int, int], object] = {}
 
 
 def _native_session(cp, native, size: int):
@@ -387,6 +459,204 @@ def _native_session(cp, native, size: int):
         session = native.TransformSession(device_id, int(size))
         _NATIVE_SESSIONS[key] = session
     return session
+
+
+def _polar_native_session(cp, native, size: int, angle_samples: int, radial_bins: int):
+    device_id = int(cp.cuda.Device().id)
+    key = (device_id, int(size), int(angle_samples), int(radial_bins))
+    session = _POLAR_NATIVE_SESSIONS.get(key)
+    if session is None:
+        session = native.PolarHardSession(
+            device_id,
+            int(size),
+            int(angle_samples),
+            int(radial_bins),
+        )
+        _POLAR_NATIVE_SESSIONS[key] = session
+    return session
+
+
+@profile_stage("polar_sampling_cupy", cuda=True)
+def _polar_sample_cupy(
+    images,
+    image_indices,
+    centers_y,
+    centers_x,
+    mirrors,
+    offsets_y,
+    offsets_x,
+):
+    cp = _cupy()
+    source = cp.ascontiguousarray(images, dtype=cp.float32)
+    indices = cp.ascontiguousarray(image_indices, dtype=cp.int32)
+    center_y = cp.ascontiguousarray(centers_y, dtype=cp.float64)
+    center_x = cp.ascontiguousarray(centers_x, dtype=cp.float64)
+    mirror_values = cp.ascontiguousarray(mirrors, dtype=cp.uint8)
+    offset_y = cp.ascontiguousarray(offsets_y, dtype=cp.float64)
+    offset_x = cp.ascontiguousarray(offsets_x, dtype=cp.float64)
+    if source.ndim != 3 or source.shape[1] != source.shape[2]:
+        raise ValueError("polar images must have shape (N, H, H)")
+    count = int(indices.size)
+    if not (center_y.shape == center_x.shape == mirror_values.shape == (count,)):
+        raise ValueError("polar sampling arrays must be one-dimensional and equal")
+    if offset_y.shape != offset_x.shape or offset_y.ndim != 2:
+        raise ValueError("polar offsets must have matching (angle, radius) shapes")
+    angle_samples, radial_bins = map(int, offset_y.shape)
+    output = cp.empty((count, angle_samples, radial_bins), dtype=cp.float32)
+    kernel = cp.RawKernel(_POLAR_SAMPLE_KERNEL, "polar_sample_quantized")
+    threads = 256
+    blocks = (output.size + threads - 1) // threads
+    kernel(
+        (blocks,),
+        (threads,),
+        (
+            source,
+            indices,
+            center_y,
+            center_x,
+            mirror_values,
+            offset_y,
+            offset_x,
+            output,
+            np.int32(len(source)),
+            np.int32(count),
+            np.int32(source.shape[1]),
+            np.int32(angle_samples),
+            np.int32(radial_bins),
+        ),
+    )
+    profile_count("cupy_polar_sampling_calls")
+    profile_count("polar_sampled_centers", count)
+    return output
+
+
+@profile_stage("polar_sampling_native", cuda=True)
+def _polar_sample_cuda(
+    images,
+    image_indices,
+    centers_y,
+    centers_x,
+    mirrors,
+    offsets_y,
+    offsets_x,
+):
+    cp = _cupy()
+    native = _native_module()
+    if native is None or not hasattr(native, "PolarHardSession"):
+        raise RuntimeError(
+            "native CUDA extension does not provide the polar_hard kernel"
+        )
+    source = cp.ascontiguousarray(images, dtype=cp.float32)
+    indices = cp.ascontiguousarray(image_indices, dtype=cp.int32)
+    center_y = cp.ascontiguousarray(centers_y, dtype=cp.float64)
+    center_x = cp.ascontiguousarray(centers_x, dtype=cp.float64)
+    mirror_values = cp.ascontiguousarray(mirrors, dtype=cp.uint8)
+    offset_y = cp.ascontiguousarray(offsets_y, dtype=cp.float64)
+    offset_x = cp.ascontiguousarray(offsets_x, dtype=cp.float64)
+    if source.ndim != 3 or source.shape[1] != source.shape[2]:
+        raise ValueError("polar images must have shape (N, H, H)")
+    count = int(indices.size)
+    if not (center_y.shape == center_x.shape == mirror_values.shape == (count,)):
+        raise ValueError("polar sampling arrays must be one-dimensional and equal")
+    if offset_y.shape != offset_x.shape or offset_y.ndim != 2:
+        raise ValueError("polar offsets must have matching (angle, radius) shapes")
+    angle_samples, radial_bins = map(int, offset_y.shape)
+    output = cp.empty((count, angle_samples, radial_bins), dtype=cp.float32)
+    session = _polar_native_session(
+        cp,
+        native,
+        int(source.shape[1]),
+        angle_samples,
+        radial_bins,
+    )
+    session.sample_device(
+        int(source.data.ptr),
+        int(indices.data.ptr),
+        int(center_y.data.ptr),
+        int(center_x.data.ptr),
+        int(mirror_values.data.ptr),
+        int(offset_y.data.ptr),
+        int(offset_x.data.ptr),
+        int(output.data.ptr),
+        int(len(source)),
+        count,
+        int(cp.cuda.get_current_stream().ptr),
+    )
+    profile_count("native_polar_sampling_calls")
+    profile_count("native_polar_sampled_centers", count)
+    profile_count("polar_sampled_centers", count)
+    return output
+
+
+def _normalize_polar_rings_gpu(rings):
+    cp = _cupy()
+    values = cp.ascontiguousarray(rings, dtype=cp.float32)
+    values -= cp.mean(values, axis=1, keepdims=True)
+    weights = cp.sqrt(cp.arange(values.shape[2], dtype=cp.float32) + cp.float32(0.5))
+    values *= weights[None, None, :]
+    norms = cp.linalg.norm(values.reshape(len(values), -1), axis=1)
+    values /= cp.maximum(norms[:, None, None], cp.float32(1e-12))
+    return values
+
+
+@profile_stage("polar_peak_cupy", cuda=True)
+def _polar_peak_cupy(curves):
+    cp = _cupy()
+    values = cp.ascontiguousarray(curves, dtype=cp.float64)
+    if values.ndim != 2 or values.shape[1] < 3:
+        raise ValueError("polar curves must have shape (N, angle_samples>=3)")
+    count, angle_samples = map(int, values.shape)
+    rows = cp.arange(count, dtype=cp.int32)
+    peak = cp.argmax(values, axis=1).astype(cp.int32)
+    previous = values[rows, (peak - 1) % angle_samples]
+    center = values[rows, peak]
+    following = values[rows, (peak + 1) % angle_samples]
+    denominator = previous - 2.0 * center + following
+    concave = cp.isfinite(denominator) & (denominator < 0.0)
+    offset = cp.where(
+        concave,
+        0.5 * (previous - following) / cp.where(concave, denominator, -1.0),
+        0.0,
+    )
+    accepted = concave & cp.isfinite(offset) & (cp.abs(offset) <= 0.5)
+    offset = cp.where(accepted, offset, 0.0)
+    score = center - 0.25 * (previous - following) * offset
+    profile_count("cupy_polar_peak_calls")
+    profile_count("cupy_polar_peak_curves", count)
+    return peak, offset, score, accepted
+
+
+@profile_stage("polar_peak_native", cuda=True)
+def _polar_peak_cuda(curves, image_size: int, radial_bins: int):
+    cp = _cupy()
+    native = _native_module()
+    if native is None or not hasattr(native, "PolarHardSession"):
+        raise RuntimeError(
+            "native CUDA extension does not provide the polar_hard kernel"
+        )
+    values = cp.ascontiguousarray(curves, dtype=cp.float64)
+    if values.ndim != 2 or values.shape[1] < 3:
+        raise ValueError("polar curves must have shape (N, angle_samples>=3)")
+    count, angle_samples = map(int, values.shape)
+    peak = cp.empty(count, dtype=cp.int32)
+    offset = cp.empty(count, dtype=cp.float64)
+    score = cp.empty(count, dtype=cp.float64)
+    accepted = cp.empty(count, dtype=cp.uint8)
+    session = _polar_native_session(
+        cp, native, int(image_size), angle_samples, int(radial_bins)
+    )
+    session.angular_peak_device(
+        int(values.data.ptr),
+        int(peak.data.ptr),
+        int(offset.data.ptr),
+        int(score.data.ptr),
+        int(accepted.data.ptr),
+        count,
+        int(cp.cuda.get_current_stream().ptr),
+    )
+    profile_count("native_polar_peak_calls")
+    profile_count("native_polar_peak_curves", count)
+    return peak, offset, score, accepted.astype(cp.bool_)
 
 
 @profile_stage("spatial_transform", cuda=True)
@@ -600,9 +870,13 @@ def _quadratic_peak_cupy(objective_surface):
 
     def fit(left, right, interior):
         denominator = left - 2.0 * center + right
-        epsilon = 32.0 * np.finfo(np.float64).eps * cp.maximum(
-            cp.maximum(cp.abs(left), cp.maximum(cp.abs(center), cp.abs(right))),
-            1.0,
+        epsilon = (
+            32.0
+            * np.finfo(np.float64).eps
+            * cp.maximum(
+                cp.maximum(cp.abs(left), cp.maximum(cp.abs(center), cp.abs(right))),
+                1.0,
+            )
         )
         concave = interior & (denominator < -epsilon)
         offset = cp.where(
@@ -681,9 +955,7 @@ def _quadratic_exact_translation_rescore_gpu(
         + ((fitted_x - center_x) / pose_shift_sigma) ** 2
     )
     proposed_count = valid_y.astype(cp.int32) + valid_x.astype(cp.int32)
-    accept = (proposed_count > 0) & (
-        fitted_objective > integer_objective + 1e-12
-    )
+    accept = (proposed_count > 0) & (fitted_objective > integer_objective + 1e-12)
     return (
         cp.where(accept, fitted_y, integer_y),
         cp.where(accept, fitted_x, integer_x),
@@ -825,15 +1097,15 @@ def _transform_cached_fourier(
                 mirrors,
             )
         source = device_fourier[
-            _asdevice(particle_indices)
-            if device_particle_indices is None
-            else device_particle_indices
+            (
+                _asdevice(particle_indices)
+                if device_particle_indices is None
+                else device_particle_indices
+            )
         ]
     else:
         source = host_fourier[np.asarray(particle_indices, dtype=np.int32)]
-    return fourier_transform_batch(
-        source, angles, shifts_y, shifts_x, mirrors
-    )
+    return fourier_transform_batch(source, angles, shifts_y, shifts_x, mirrors)
 
 
 def _transform_fourier_engine(
@@ -937,9 +1209,9 @@ def _score_fourier_candidates_engine(
             axis=(1, 2),
         )
         denominator = cp.sqrt(transformed_norm * reference_norm[reference_ids])
-        output[start:stop] = _ashost(
-            numerator / cp.maximum(denominator, 1e-12)
-        ).astype(np.float32)
+        output[start:stop] = _ashost(numerator / cp.maximum(denominator, 1e-12)).astype(
+            np.float32
+        )
     return output
 
 
@@ -1041,7 +1313,9 @@ def _final_raw_class_averages_gpu_engine(
     validate_even_square(tuple(values.shape[1:]))
     if len(poses) != len(values):
         raise ValueError("poses and raw images must contain the same number of items")
-    if assignment_values.shape != (len(values),) or weight_values.shape != (len(values),):
+    if assignment_values.shape != (len(values),) or weight_values.shape != (
+        len(values),
+    ):
         raise ValueError("assignments and weights must match the raw image count")
     reference_count = len(reference_values)
     if reference_count < 1 or (
@@ -1484,8 +1758,7 @@ def _gpu_adaptive_candidate_inference_once(
             particles.fourier,
             config,
             role="scoring",
-            fixed_bytes=len(references.spatial) * size * size * 16
-            + weight_fixed_bytes,
+            fixed_bytes=len(references.spatial) * size * size * 16 + weight_fixed_bytes,
             bytes_per_item=max(1, size * size * 64),
             workspace=workspace,
             memory_records=memory_records,
@@ -1495,8 +1768,7 @@ def _gpu_adaptive_candidate_inference_once(
             free_bytes=int(free_bytes),
             total_bytes=int(total_bytes),
             memory_fraction=float(config.memory_fraction),
-            fixed_bytes=len(references.spatial) * size * size * 16
-            + weight_fixed_bytes,
+            fixed_bytes=len(references.spatial) * size * size * 16 + weight_fixed_bytes,
             bytes_per_item=max(1, size * size * 64),
             requested_batch_size=config.batch_size,
         )
@@ -1519,9 +1791,7 @@ def _gpu_adaptive_candidate_inference_once(
         )
     frequency = _asdevice(np.fft.fftfreq(size), dtype=cp.float32)
     frequency_y, frequency_x = cp.meshgrid(frequency, frequency, indexing="ij")
-    score_weight_profiles = _asdevice(
-        particles.score_weight_profiles, dtype=cp.float32
-    )
+    score_weight_profiles = _asdevice(particles.score_weight_profiles, dtype=cp.float32)
     score_weight_bins = _asdevice(particles.score_weight_bins)
     frequency_mask = _asdevice(particles.frequency_mask, dtype=cp.float32)
     reference_fft = _asdevice(references.fourier)
@@ -1581,9 +1851,7 @@ def _gpu_adaptive_candidate_inference_once(
             batch = values[start:stop]
             batch_particle_indices = flat_particle_indices[start:stop]
             count = len(batch)
-            device_particle_indices = _asdevice(
-                batch_particle_indices, dtype=cp.int32
-            )
+            device_particle_indices = _asdevice(batch_particle_indices, dtype=cp.int32)
             if config.candidate_scoring == "fourier":
                 shifted = _transform_cached_fourier(
                     particle_fft,
@@ -1618,9 +1886,7 @@ def _gpu_adaptive_candidate_inference_once(
                 )
                 shifted = transformed_fft * phase
             with profile_scope("fourier_ncc", cuda=True):
-                reference_indices = _asdevice(
-                    batch["reference_index"], dtype=cp.int32
-                )
+                reference_indices = _asdevice(batch["reference_index"], dtype=cp.int32)
                 selected_reference = reference_fft[reference_indices]
                 if profile_count_value == 1:
                     score_weights = shared_score_weights[None]
@@ -1645,9 +1911,7 @@ def _gpu_adaptive_candidate_inference_once(
                     score_weights * cp.abs(shifted) ** 2,
                     axis=(1, 2),
                 )
-                denominator = cp.sqrt(
-                    transformed_norm * candidate_reference_norm
-                )
+                denominator = cp.sqrt(transformed_norm * candidate_reference_norm)
                 output[start:stop] = _ashost(
                     numerator / cp.maximum(denominator, 1e-12)
                 ).astype(np.float32)
@@ -1706,7 +1970,6 @@ def _gpu_quadratic_candidate_inference_once(
     if initial_poses is None:
         raise ValueError("quadratic_refine search requires initial_poses")
     cp = _cupy()
-    particle_count = len(particles.spatial)
     reference_count = len(references.spatial)
     size = int(particles.spatial.shape[1])
     weight_fixed_bytes = (
@@ -1737,14 +2000,10 @@ def _gpu_quadratic_candidate_inference_once(
 
     reference_fft = _asdevice(references.fourier, dtype=cp.complex64)
     frequency_mask = _asdevice(particles.frequency_mask, dtype=cp.float32)
-    score_weight_profiles = _asdevice(
-        particles.score_weight_profiles, dtype=cp.float32
-    )
+    score_weight_profiles = _asdevice(particles.score_weight_profiles, dtype=cp.float32)
     score_weight_bins = _asdevice(particles.score_weight_bins)
     profile_count_value = len(score_weight_profiles)
-    reference_norm = cp.empty(
-        (profile_count_value, reference_count), dtype=cp.float32
-    )
+    reference_norm = cp.empty((profile_count_value, reference_count), dtype=cp.float32)
     reference_norm_ready = np.zeros(profile_count_value, dtype=np.bool_)
     frequency = _asdevice(np.fft.fftfreq(size), dtype=cp.float32)
     frequency_y, frequency_x = cp.meshgrid(frequency, frequency, indexing="ij")
@@ -1767,8 +2026,7 @@ def _gpu_quadratic_candidate_inference_once(
         shifts_x = _integer_window(center_x, attempt.local_shift_range)
         profile_index = 0 if profile_count_value == 1 else int(particle_index)
         score_weights = (
-            frequency_mask
-            * score_weight_profiles[profile_index][score_weight_bins]
+            frequency_mask * score_weight_profiles[profile_index][score_weight_bins]
         )
         if not reference_norm_ready[profile_index]:
             with profile_scope("reference_norm", cuda=True):
@@ -1791,9 +2049,7 @@ def _gpu_quadratic_candidate_inference_once(
             batch_angles = angle_values[start:stop].astype(np.float32)
             count = len(batch_angles)
             particle_indices = np.full(count, particle_index, dtype=np.int32)
-            device_particle_indices = _asdevice(
-                particle_indices, dtype=cp.int32
-            )
+            device_particle_indices = _asdevice(particle_indices, dtype=cp.int32)
             transformed = _transform_cached_fourier(
                 particle_fft,
                 particles.fourier,
@@ -1813,17 +2069,15 @@ def _gpu_quadratic_candidate_inference_once(
                     * transformed
                     * cp.conj(selected_reference)[None]
                 )
-                correlation = (
-                    cp.fft.ifft2(cross_power, axes=(-2, -1)).real
-                    * (size * size)
+                correlation = cp.fft.ifft2(cross_power, axes=(-2, -1)).real * (
+                    size * size
                 )
                 transformed_norm = cp.sum(
                     score_weights[None] * cp.abs(transformed) ** 2,
                     axis=(1, 2),
                 )
                 denominator = cp.sqrt(
-                    transformed_norm
-                    * reference_norm[profile_index, reference_index]
+                    transformed_norm * reference_norm[profile_index, reference_index]
                 )
                 device_y = _asdevice(shifts_y, dtype=cp.int32)
                 device_x = _asdevice(shifts_x, dtype=cp.int32)
@@ -1834,14 +2088,22 @@ def _gpu_quadratic_candidate_inference_once(
                     ((-device_x) % size)[None, None, :],
                 ] / cp.maximum(denominator[:, None, None], 1e-12)
                 objective_surface = score_surface / float(current_temperature)
-                objective_surface -= 0.5 * (
-                    (device_y.astype(cp.float64) - center_y)
-                    / float(attempt.pose_shift_sigma)
-                )[None, :, None] ** 2
-                objective_surface -= 0.5 * (
-                    (device_x.astype(cp.float64) - center_x)
-                    / float(attempt.pose_shift_sigma)
-                )[None, None, :] ** 2
+                objective_surface -= (
+                    0.5
+                    * (
+                        (device_y.astype(cp.float64) - center_y)
+                        / float(attempt.pose_shift_sigma)
+                    )[None, :, None]
+                    ** 2
+                )
+                objective_surface -= (
+                    0.5
+                    * (
+                        (device_x.astype(cp.float64) - center_x)
+                        / float(attempt.pose_shift_sigma)
+                    )[None, None, :]
+                    ** 2
+                )
                 if indexed_fourier_transform_batch is not None:
                     (
                         peak_y_index,
@@ -1871,9 +2133,7 @@ def _gpu_quadratic_candidate_inference_once(
                 batch_rows = cp.arange(count, dtype=cp.int32)
                 integer_y = device_y[peak_y_index].astype(cp.float64)
                 integer_x = device_x[peak_x_index].astype(cp.float64)
-                integer_score = score_surface[
-                    batch_rows, peak_y_index, peak_x_index
-                ]
+                integer_score = score_surface[batch_rows, peak_y_index, peak_x_index]
                 integer_objective = objective_surface[
                     batch_rows, peak_y_index, peak_x_index
                 ]
@@ -1913,8 +2173,7 @@ def _gpu_quadratic_candidate_inference_once(
                         cp.sum(~interior_y) + cp.sum(~interior_x),
                         cp.sum(interior_y & ~concave_y)
                         + cp.sum(interior_x & ~concave_x),
-                        cp.sum(concave_y & ~valid_y)
-                        + cp.sum(concave_x & ~valid_x),
+                        cp.sum(concave_y & ~valid_y) + cp.sum(concave_x & ~valid_x),
                         cp.sum(proposed_count * (~accept).astype(cp.int32)),
                         cp.sum(
                             cp.where(
@@ -1974,6 +2233,520 @@ def _is_oom(error: Exception) -> bool:
     )
 
 
+def _polar_memory_plan(
+    config: AlignmentConfig,
+    size: int,
+    particle_count: int,
+    reference_count: int,
+    angle_samples: int,
+    radial_bins: int,
+    maximum_centers: int,
+    mirror_count: int,
+) -> MemoryPlan:
+    cp = _cupy()
+    # Completed workflows and earlier iterations return arrays to CuPy's pool,
+    # not to the CUDA driver. Release unused cached blocks before reading
+    # memGetInfo so a later case is not incorrectly forced to batch size one.
+    cp.get_default_memory_pool().free_all_blocks()
+    free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+    image_bytes = int(size) * int(size) * 4
+    ring_values = int(angle_samples) * int(radial_bins)
+    curve_values = int(reference_count) * int(angle_samples)
+    fixed_bytes = image_bytes * (
+        int(particle_count) + int(reference_count)
+    ) + ring_values * int(reference_count) * (4 + 8)
+    # Per sampled particle/translation/mirror center: real rings, angular FFT,
+    # reduced cross spectrum, correlation curves, selection scratch, and a 1.5x
+    # allowance for cuFFT/einsum workspaces that are not visible as result arrays.
+    bytes_per_center = ring_values * (4 + 8) + curve_values * (8 + 4) + 256
+    bytes_per_particle = bytes_per_center * int(maximum_centers) * int(mirror_count)
+    bytes_per_particle = (bytes_per_particle * 3 + 1) // 2
+    return plan_batch_size(
+        free_bytes=int(free_bytes),
+        total_bytes=int(total_bytes),
+        memory_fraction=float(config.memory_fraction),
+        fixed_bytes=fixed_bytes,
+        bytes_per_item=max(1, bytes_per_particle),
+        requested_batch_size=config.batch_size,
+    )
+
+
+def _polar_grid_arrays(
+    translation_centers: np.ndarray,
+    *,
+    size: int,
+    radius: float,
+    config: AlignmentConfig,
+):
+    grids = []
+    boundary_rejected = []
+    for center_y, center_x in translation_centers:
+        grid, rejected = translation_center_grid(
+            float(center_y),
+            float(center_x),
+            size=size,
+            radius=radius,
+            translation_range=config.translation_range,
+            translation_step=config.translation_step,
+        )
+        grids.append(grid)
+        boundary_rejected.append(rejected)
+    maximum = max(map(len, grids))
+    grid_y = np.zeros((len(grids), maximum), dtype=np.float64)
+    grid_x = np.zeros((len(grids), maximum), dtype=np.float64)
+    valid = np.zeros((len(grids), maximum), dtype=np.bool_)
+    lengths = np.empty(len(grids), dtype=np.int32)
+    for index, grid in enumerate(grids):
+        lengths[index] = len(grid)
+        grid_y[index, : len(grid)] = [value[0] for value in grid]
+        grid_x[index, : len(grid)] = [value[1] for value in grid]
+        valid[index, : len(grid)] = True
+    return (
+        grid_y,
+        grid_x,
+        valid,
+        lengths,
+        np.asarray(boundary_rejected, dtype=np.int32),
+    )
+
+
+@profile_stage("polar_hard_gpu", cuda=True)
+def _gpu_polar_hard_candidate_inference_once(
+    particles,
+    references,
+    config,
+    class_priors,
+    temperature,
+    initial_poses,
+    *,
+    translation_centers=None,
+    rescue_mask=None,
+    engine: str,
+    particle_limit: int,
+    memory_records=None,
+):
+    del initial_poses, rescue_mask
+    cp = _cupy()
+    particle_count = len(particles.spatial)
+    reference_count = len(references.spatial)
+    if config.top_l != 1:
+        raise ValueError("polar_hard requires top_l=1")
+    if translation_centers is None:
+        center_state = np.zeros((particle_count, 2), dtype=np.float64)
+    else:
+        center_state = np.asarray(translation_centers, dtype=np.float64)
+        if center_state.shape != (particle_count, 2) or not np.all(
+            np.isfinite(center_state)
+        ):
+            raise ValueError(
+                "translation_centers must have finite shape (particle_count, 2)"
+            )
+
+    size = validate_even_square(tuple(particles.spatial.shape[1:]))
+    radius = polar_radius(size, config)
+    angle_samples = int(config.angle_samples)
+    radial_bins = max(4, int(np.floor(radius)))
+    mirror_count = 2 if config.mirror_search else 1
+    (
+        grid_y,
+        grid_x,
+        grid_valid,
+        grid_lengths,
+        boundary_rejected,
+    ) = _polar_grid_arrays(
+        center_state,
+        size=size,
+        radius=radius,
+        config=config,
+    )
+    maximum_centers = int(grid_y.shape[1])
+    offsets_y, offsets_x = _polar_offsets(radius, angle_samples, radial_bins)
+    device_offsets_y = _asdevice(offsets_y, dtype=cp.float64)
+    device_offsets_x = _asdevice(offsets_x, dtype=cp.float64)
+    device_grid_y = _asdevice(grid_y, dtype=cp.float64)
+    device_grid_x = _asdevice(grid_x, dtype=cp.float64)
+    device_grid_valid = _asdevice(grid_valid, dtype=cp.bool_)
+    device_grid_lengths = _asdevice(grid_lengths, dtype=cp.int64)
+    device_priors = _asdevice(class_priors, dtype=cp.float64)
+    active_priors = device_priors > 0.0
+    fixed_reference_indices = None
+    if np.all(np.count_nonzero(class_priors > 0.0, axis=1) == 1):
+        fixed_reference_indices = _asdevice(
+            np.argmax(class_priors, axis=1).astype(np.int32), dtype=cp.int32
+        )
+    log_priors = cp.log(cp.maximum(device_priors, np.finfo(np.float64).tiny))
+    particle_images = _asdevice(particles.spatial, dtype=cp.float32, order="C")
+    reference_images = _asdevice(references.spatial, dtype=cp.float32, order="C")
+
+    if engine == "cuda":
+        sampler = _polar_sample_cuda
+
+        def peak_selector(curves):
+            return _polar_peak_cuda(curves, size, radial_bins)
+
+    elif engine == "cupy":
+        sampler = _polar_sample_cupy
+        peak_selector = _polar_peak_cupy
+    else:
+        raise ValueError("polar_hard GPU engine must be 'cuda' or 'cupy'")
+
+    reference_rings = sampler(
+        reference_images,
+        cp.arange(reference_count, dtype=cp.int32),
+        cp.zeros(reference_count, dtype=cp.float64),
+        cp.zeros(reference_count, dtype=cp.float64),
+        cp.zeros(reference_count, dtype=cp.uint8),
+        device_offsets_y,
+        device_offsets_x,
+    )
+    reference_rings = _normalize_polar_rings_gpu(reference_rings)
+    reference_fft = cp.fft.rfft(reference_rings, axis=1)
+
+    best_objective = cp.full(particle_count, -cp.inf, dtype=cp.float64)
+    best_flat_id = cp.full(particle_count, np.iinfo(np.int64).max, dtype=cp.int64)
+    second_objective = cp.full(particle_count, -cp.inf, dtype=cp.float64)
+    second_flat_id = cp.full(particle_count, np.iinfo(np.int64).max, dtype=cp.int64)
+    best_score = cp.full(particle_count, -cp.inf, dtype=cp.float64)
+    best_reference = cp.zeros(particle_count, dtype=cp.int32)
+    best_angle = cp.zeros(particle_count, dtype=cp.float64)
+    best_center_y = cp.zeros(particle_count, dtype=cp.float64)
+    best_center_x = cp.zeros(particle_count, dtype=cp.float64)
+    best_mirror = cp.zeros(particle_count, dtype=cp.uint8)
+    best_peak = cp.zeros(particle_count, dtype=cp.int32)
+    best_accepted = cp.zeros(particle_count, dtype=cp.bool_)
+
+    particle_batch = max(1, min(particle_count, int(particle_limit)))
+    for particle_start in range(0, particle_count, particle_batch):
+        particle_stop = min(particle_count, particle_start + particle_batch)
+        batch_count = particle_stop - particle_start
+        center_batch = maximum_centers
+        particle_rows = cp.arange(particle_start, particle_stop, dtype=cp.int32)
+        local_rows = cp.arange(batch_count, dtype=cp.int32)
+        for center_start in range(0, maximum_centers, center_batch):
+            center_stop = min(maximum_centers, center_start + center_batch)
+            center_count = center_stop - center_start
+            combo_shape = (batch_count, mirror_count, center_count)
+            image_indices = cp.broadcast_to(
+                particle_rows[:, None, None], combo_shape
+            ).reshape(-1)
+            center_y = cp.broadcast_to(
+                device_grid_y[
+                    particle_start:particle_stop,
+                    None,
+                    center_start:center_stop,
+                ],
+                combo_shape,
+            ).reshape(-1)
+            center_x = cp.broadcast_to(
+                device_grid_x[
+                    particle_start:particle_stop,
+                    None,
+                    center_start:center_stop,
+                ],
+                combo_shape,
+            ).reshape(-1)
+            mirrors = cp.broadcast_to(
+                cp.arange(mirror_count, dtype=cp.uint8)[None, :, None],
+                combo_shape,
+            ).reshape(-1)
+            rings = sampler(
+                particle_images,
+                image_indices,
+                center_y,
+                center_x,
+                mirrors,
+                device_offsets_y,
+                device_offsets_x,
+            )
+            rings = _normalize_polar_rings_gpu(rings).reshape(
+                batch_count,
+                mirror_count,
+                center_count,
+                angle_samples,
+                radial_bins,
+            )
+            subject_fft = cp.fft.rfft(rings, axis=3)
+            output_shape = (
+                batch_count,
+                mirror_count,
+                center_count,
+                reference_count,
+            )
+            if fixed_reference_indices is None:
+                cross_spectrum = cp.einsum(
+                    "pmcfr,kfr->pmckf",
+                    subject_fft,
+                    cp.conj(reference_fft),
+                    optimize=True,
+                )
+                curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
+                curve_count = int(np.prod(curves.shape[:-1]))
+                peak, offset, score, accepted = peak_selector(
+                    curves.reshape(curve_count, angle_samples)
+                )
+                peak = peak.reshape(output_shape)
+                offset = offset.reshape(output_shape)
+                score = score.reshape(output_shape)
+                accepted = accepted.reshape(output_shape)
+            else:
+                fixed_references = fixed_reference_indices[particle_rows]
+                fixed_reference_fft = reference_fft[fixed_references]
+                cross_spectrum = cp.einsum(
+                    "pmcfr,pfr->pmcf",
+                    subject_fft,
+                    cp.conj(fixed_reference_fft),
+                    optimize=True,
+                )
+                curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
+                curve_count = int(np.prod(curves.shape[:-1]))
+                active_peak, active_offset, active_score, active_accepted = (
+                    peak_selector(curves.reshape(curve_count, angle_samples))
+                )
+                active_shape = (batch_count, mirror_count, center_count)
+                active_peak = active_peak.reshape(active_shape)
+                active_offset = active_offset.reshape(active_shape)
+                active_score = active_score.reshape(active_shape)
+                active_accepted = active_accepted.reshape(active_shape)
+                active_slots = (
+                    cp.arange(reference_count, dtype=cp.int32)[None, None, None, :]
+                    == fixed_references[:, None, None, None]
+                )
+                peak = cp.where(active_slots, active_peak[..., None], 0)
+                offset = cp.where(active_slots, active_offset[..., None], 0.0)
+                score = cp.where(active_slots, active_score[..., None], -cp.inf)
+                accepted = active_slots & active_accepted[..., None]
+            objective = score / float(temperature)
+            objective += log_priors[particle_start:particle_stop, None, None, :]
+            valid = device_grid_valid[
+                particle_start:particle_stop,
+                None,
+                center_start:center_stop,
+                None,
+            ]
+            valid = valid & active_priors[particle_start:particle_stop, None, None, :]
+            objective = cp.where(valid, objective, -cp.inf)
+            ordered = objective.transpose(0, 3, 1, 2).reshape(batch_count, -1)
+            local_index = cp.argmax(ordered, axis=1).astype(cp.int64)
+            candidate_columns = cp.arange(ordered.shape[1], dtype=cp.int64)
+            without_best = cp.where(
+                candidate_columns[None, :] == local_index[:, None],
+                -cp.inf,
+                ordered,
+            )
+            local_second_index = cp.argmax(without_best, axis=1).astype(cp.int64)
+            local_center = (local_index % center_count).astype(cp.int32)
+            reference_mirror = local_index // center_count
+            mirror_index = (reference_mirror % mirror_count).astype(cp.int32)
+            reference_index = (reference_mirror // mirror_count).astype(cp.int32)
+            global_center = local_center + center_start
+            selected_objective = objective[
+                local_rows, mirror_index, local_center, reference_index
+            ]
+            selected_peak = peak[
+                local_rows, mirror_index, local_center, reference_index
+            ]
+            selected_flat_id = (
+                (
+                    reference_index.astype(cp.int64) * mirror_count
+                    + mirror_index.astype(cp.int64)
+                )
+                * device_grid_lengths[particle_rows]
+                + global_center.astype(cp.int64)
+            ) * angle_samples + selected_peak.astype(cp.int64)
+            local_second_center = (local_second_index % center_count).astype(cp.int32)
+            local_second_reference_mirror = local_second_index // center_count
+            local_second_mirror = (local_second_reference_mirror % mirror_count).astype(
+                cp.int32
+            )
+            local_second_reference = (
+                local_second_reference_mirror // mirror_count
+            ).astype(cp.int32)
+            local_second_global_center = local_second_center + center_start
+            local_second_objective = without_best[local_rows, local_second_index]
+            local_second_peak = peak[
+                local_rows,
+                local_second_mirror,
+                local_second_center,
+                local_second_reference,
+            ]
+            local_second_flat_id = (
+                (
+                    local_second_reference.astype(cp.int64) * mirror_count
+                    + local_second_mirror.astype(cp.int64)
+                )
+                * device_grid_lengths[particle_rows]
+                + local_second_global_center.astype(cp.int64)
+            ) * angle_samples + local_second_peak.astype(cp.int64)
+            local_second_flat_id = cp.where(
+                cp.isfinite(local_second_objective),
+                local_second_flat_id,
+                np.iinfo(np.int64).max,
+            )
+            old_objective = best_objective[particle_rows]
+            old_flat_id = best_flat_id[particle_rows]
+            better = (selected_objective > old_objective) | (
+                (selected_objective == old_objective) & (selected_flat_id < old_flat_id)
+            )
+            objective_pool = cp.stack(
+                (
+                    old_objective,
+                    second_objective[particle_rows],
+                    selected_objective,
+                    local_second_objective,
+                ),
+                axis=1,
+            )
+            flat_id_pool = cp.stack(
+                (
+                    old_flat_id,
+                    second_flat_id[particle_rows],
+                    selected_flat_id,
+                    local_second_flat_id,
+                ),
+                axis=1,
+            )
+            pool_maximum = cp.max(objective_pool, axis=1)
+            best_pool_index = cp.argmin(
+                cp.where(
+                    objective_pool == pool_maximum[:, None],
+                    flat_id_pool,
+                    np.iinfo(np.int64).max,
+                ),
+                axis=1,
+            ).astype(cp.int64)
+            pool_columns = cp.arange(4, dtype=cp.int64)
+            remaining_objectives = cp.where(
+                pool_columns[None, :] == best_pool_index[:, None],
+                -cp.inf,
+                objective_pool,
+            )
+            second_pool_maximum = cp.max(remaining_objectives, axis=1)
+            second_pool_index = cp.argmin(
+                cp.where(
+                    remaining_objectives == second_pool_maximum[:, None],
+                    flat_id_pool,
+                    np.iinfo(np.int64).max,
+                ),
+                axis=1,
+            ).astype(cp.int64)
+            best_objective[particle_rows] = objective_pool[local_rows, best_pool_index]
+            best_flat_id[particle_rows] = flat_id_pool[local_rows, best_pool_index]
+            second_objective[particle_rows] = objective_pool[
+                local_rows, second_pool_index
+            ]
+            second_flat_id[particle_rows] = flat_id_pool[local_rows, second_pool_index]
+            selected_offset = offset[
+                local_rows, mirror_index, local_center, reference_index
+            ]
+            selected_angle = (selected_peak.astype(cp.float64) + selected_offset) * (
+                360.0 / angle_samples
+            )
+            selected_angle = (selected_angle + 180.0) % 360.0 - 180.0
+            best_score[particle_rows] = cp.where(
+                better,
+                score[local_rows, mirror_index, local_center, reference_index],
+                best_score[particle_rows],
+            )
+            best_reference[particle_rows] = cp.where(
+                better, reference_index, best_reference[particle_rows]
+            )
+            best_angle[particle_rows] = cp.where(
+                better, selected_angle, best_angle[particle_rows]
+            )
+            best_center_y[particle_rows] = cp.where(
+                better,
+                device_grid_y[particle_rows, global_center],
+                best_center_y[particle_rows],
+            )
+            best_center_x[particle_rows] = cp.where(
+                better,
+                device_grid_x[particle_rows, global_center],
+                best_center_x[particle_rows],
+            )
+            best_mirror[particle_rows] = cp.where(
+                better,
+                mirror_index.astype(cp.uint8),
+                best_mirror[particle_rows],
+            )
+            best_peak[particle_rows] = cp.where(
+                better, selected_peak, best_peak[particle_rows]
+            )
+            best_accepted[particle_rows] = cp.where(
+                better,
+                accepted[local_rows, mirror_index, local_center, reference_index],
+                best_accepted[particle_rows],
+            )
+            profile_count("polar_gpu_subject_fft_calls")
+            profile_count("polar_gpu_subject_centers", int(np.prod(combo_shape)))
+            profile_count("polar_gpu_correlation_curves", curve_count)
+
+    radians = best_angle * (np.pi / 180.0)
+    cosine = cp.cos(radians)
+    sine = cp.sin(radians)
+    shift_x = -(cosine * best_center_x + sine * best_center_y)
+    shift_y = sine * best_center_x - cosine * best_center_y
+    objective_margin = best_objective - second_objective
+    packed = cp.stack(
+        (
+            best_reference.astype(cp.float64),
+            best_angle,
+            shift_y,
+            shift_x,
+            best_mirror.astype(cp.float64),
+            best_score,
+            best_center_y,
+            best_center_x,
+            best_peak.astype(cp.float64),
+            best_accepted.astype(cp.float64),
+            objective_margin,
+        ),
+        axis=1,
+    )
+    host = _ashost(packed)
+    if not np.all(np.isfinite(host[:, [0, 1, 2, 3, 5, 6, 7, 8, 9]])):
+        raise RuntimeError("polar_hard GPU search produced non-finite output")
+    shape = (particle_count, 1)
+    if memory_records is not None:
+        memory_records.append(
+            {
+                "stage": "polar_hard_candidate_inference",
+                "event": "complete",
+                "engine": engine,
+                "particle_batch_size": int(particle_batch),
+                "maximum_combo_batch_size": int(
+                    particle_batch * mirror_count * maximum_centers
+                ),
+                "maximum_translation_centers": maximum_centers,
+                "radial_bins": radial_bins,
+                "angle_samples": angle_samples,
+                "full_correlation_map_d2h_bytes": 0,
+                "final_result_d2h_bytes": int(host.nbytes),
+            }
+        )
+    return {
+        "reference_index": host[:, 0].astype(np.int32).reshape(shape),
+        "angle_deg": host[:, 1].astype(np.float32).reshape(shape),
+        "shift_y_px": host[:, 2].astype(np.float32).reshape(shape),
+        "shift_x_px": host[:, 3].astype(np.float32).reshape(shape),
+        "mirror": host[:, 4].astype(np.bool_).reshape(shape),
+        "score": host[:, 5].astype(np.float32).reshape(shape),
+        "posterior": np.ones(shape, dtype=np.float32),
+        "_polar_center_y_px": host[:, 6].astype(np.float32).reshape(shape),
+        "_polar_center_x_px": host[:, 7].astype(np.float32).reshape(shape),
+        "_polar_raw_shift_y_px": (host[:, 6] - center_state[:, 0])
+        .astype(np.float32)
+        .reshape(shape),
+        "_polar_raw_shift_x_px": (host[:, 7] - center_state[:, 1])
+        .astype(np.float32)
+        .reshape(shape),
+        "_polar_discrete_angle_bin": host[:, 8].astype(np.int32).reshape(shape),
+        "_polar_quadratic_fit_accepted": host[:, 9].astype(np.bool_).reshape(shape),
+        "_polar_objective_margin": host[:, 10].astype(np.float32).reshape(shape),
+        "_polar_boundary_rejected_count": boundary_rejected,
+        "_polar_evaluated_center_count": grid_lengths,
+    }
+
+
 def _gpu_candidate_inference(
     particles,
     references,
@@ -1986,10 +2759,68 @@ def _gpu_candidate_inference(
     transform_batch=_transform_batch_cupy,
     fourier_transform_batch=_transform_fourier_batch_cupy,
     indexed_fourier_transform_batch=None,
+    engine="cupy",
     workspace=None,
     memory_records=None,
+    translation_centers=None,
 ):
     cp = _cupy()
+    if config.search_strategy == "polar_hard":
+        offsets = np.arange(
+            -float(config.translation_range),
+            float(config.translation_range) + 0.5 * float(config.translation_step),
+            float(config.translation_step),
+            dtype=np.float64,
+        )
+        maximum_centers = int(offsets.size**2)
+        mirror_count = 2 if config.mirror_search else 1
+        polar_plan = _polar_memory_plan(
+            config,
+            particles.spatial.shape[1],
+            len(particles.spatial),
+            len(references.spatial),
+            int(config.angle_samples),
+            max(4, int(np.floor(polar_radius(particles.spatial.shape[1], config)))),
+            maximum_centers,
+            mirror_count,
+        )
+        limit = polar_plan.batch_size
+        if memory_records is not None:
+            memory_records.append(
+                {
+                    "stage": "polar_hard_candidate_inference",
+                    "item_unit": "particle_with_translation_mirror_centers",
+                    **polar_plan.asdict(),
+                }
+            )
+        while True:
+            try:
+                return _gpu_polar_hard_candidate_inference_once(
+                    particles,
+                    references,
+                    config,
+                    class_priors,
+                    temperature,
+                    initial_poses,
+                    translation_centers=translation_centers,
+                    rescue_mask=rescue_mask,
+                    engine=engine,
+                    particle_limit=limit,
+                    memory_records=memory_records,
+                )
+            except Exception as error:
+                if not _is_oom(error) or limit == 1:
+                    raise
+                cp.get_default_memory_pool().free_all_blocks()
+                limit = max(1, limit // 2)
+                if memory_records is not None:
+                    memory_records.append(
+                        {
+                            "stage": "polar_hard_candidate_inference",
+                            "event": "oom_retry",
+                            "particle_batch_size": limit,
+                        }
+                    )
     plan = _memory_plan(config, particles.spatial.shape[1], len(references.spatial))
     limit = plan.batch_size
     if memory_records is not None:
@@ -2114,7 +2945,9 @@ def _gpu_reference_updater_once(
             memory_records=memory_records,
         )
         if memory_records is not None:
-            memory_records.append({"stage": "fourier_reference_update", **plan.asdict()})
+            memory_records.append(
+                {"stage": "fourier_reference_update", **plan.asdict()}
+            )
         sums_real = cp.zeros((reference_count, size, size), dtype=cp.float64)
         sums_imag = cp.zeros((reference_count, size, size), dtype=cp.float64)
         sums = None
@@ -2195,12 +3028,13 @@ def _gpu_reference_updater_once(
         nonempty = np.flatnonzero(host_weights > 1e-8)
         if len(nonempty):
             selected = _asdevice(nonempty, dtype=cp.int32)
-            averaged = (
-                sums_real[selected] + 1j * sums_imag[selected]
-            ) / total_weights[selected, None, None]
+            averaged = (sums_real[selected] + 1j * sums_imag[selected]) / total_weights[
+                selected, None, None
+            ]
             host_sums[nonempty] = _ashost(
-                profile_call("reference_ifft", cp.fft.ifft2, averaged,
-                             axes=(-2, -1), cuda=True).real.astype(cp.float32)
+                profile_call(
+                    "reference_ifft", cp.fft.ifft2, averaged, axes=(-2, -1), cuda=True
+                ).real.astype(cp.float32)
             )
     else:
         host_sums = _ashost(sums)
@@ -2471,16 +3305,14 @@ def _gpu_shared_reference_updater_once(
 
     half_started = time.perf_counter()
     if config.reference_update == "fourier":
-        half_spatial = np.zeros(
-            (2, reference_count, size, size), dtype=np.float32
-        )
+        half_spatial = np.zeros((2, reference_count, size, size), dtype=np.float32)
         flat_weights = host_half_weights.ravel()
         nonempty = np.flatnonzero(flat_weights > 1e-8)
         if len(nonempty):
             selected = _asdevice(nonempty, dtype=cp.int32)
-            averaged = (
-                sums_real[selected] + 1j * sums_imag[selected]
-            ) / _asdevice(flat_weights[nonempty])[:, None, None]
+            averaged = (sums_real[selected] + 1j * sums_imag[selected]) / _asdevice(
+                flat_weights[nonempty]
+            )[:, None, None]
             half_spatial.reshape(accumulator_count, size, size)[nonempty] = _ashost(
                 profile_call(
                     "halfset_reference_ifft",
@@ -2624,6 +3456,7 @@ def _run_soft_alignment_gpu_engine(
         return _gpu_candidate_inference(
             *args,
             **kwargs,
+            engine=engine,
             transform_batch=transform_batch,
             fourier_transform_batch=fourier_transform_batch,
             indexed_fourier_transform_batch=indexed_fourier_transform_batch,
@@ -2687,7 +3520,11 @@ def _run_soft_alignment_gpu_engine(
     )
     result.metadata.update(
         {
-            "engine": f"alignimg-soft-fourier-{engine}",
+            "engine": (
+                f"alignimg-polar-hard-{engine}"
+                if config.search_strategy == "polar_hard"
+                else f"alignimg-soft-fourier-{engine}"
+            ),
             "gpu_device": str(name),
             "gpu_total_seconds": time.perf_counter() - started,
             "gpu_memory_free_bytes_at_completion": int(free_bytes),
@@ -2701,46 +3538,88 @@ def _run_soft_alignment_gpu_engine(
             "quadratic_peak_backend": (
                 "native_cuda"
                 if engine == "cuda" and config.search_strategy == "quadratic_refine"
-                else "cupy"
-                if config.search_strategy == "quadratic_refine"
-                else None
+                else "cupy" if config.search_strategy == "quadratic_refine" else None
+            ),
+            "polar_sampler_backend": (
+                "native_cuda"
+                if config.search_strategy == "polar_hard" and engine == "cuda"
+                else "cupy" if config.search_strategy == "polar_hard" else None
+            ),
+            "polar_peak_backend": (
+                "native_cuda"
+                if config.search_strategy == "polar_hard" and engine == "cuda"
+                else "cupy" if config.search_strategy == "polar_hard" else None
+            ),
+            "polar_full_correlation_map_d2h": (
+                False if config.search_strategy == "polar_hard" else None
             ),
             "gpu_policy": (
-                "CPU angular-mode controller; workflow-cached particle DFTs; native CUDA "
-                "indexed Fourier rotation; CuPy batched cuFFT correlation maps, device-side "
-                "bounded peak/quadratic translation fitting, and exact Fourier rescoring"
-                if engine == "cuda"
-                and config.search_strategy == "quadratic_refine"
-                else "CPU angular-mode controller; workflow-cached particle DFTs; CuPy "
-                "Fourier rotation, batched cuFFT correlation maps, device-side bounded "
-                "peak/quadratic translation fitting, and exact Fourier rescoring"
-                if config.search_strategy == "quadratic_refine"
-                else
-                "CPU controller; workflow-cached scoring/raw particle DFTs; native CUDA indexed "
-                "Fourier candidate transforms and fused FP64 M-step accumulation; CuPy NCC"
-                if engine == "cuda"
-                and config.candidate_scoring == "fourier"
-                and config.reference_update == "fourier"
-                else "CPU controller; workflow-cached scoring/raw particle DFTs; CuPy Fourier-native candidate "
-                "and M-step transforms, NCC, and Fourier accumulation"
-                if config.candidate_scoring == "fourier"
-                and config.reference_update == "fourier"
-                else "CPU controller; cached particle DFT; native CUDA Fourier-native "
-                "candidate transform; CuPy NCC reduction; native CUDA real-space soft accumulation"
-                if engine == "cuda" and config.candidate_scoring == "fourier"
-                else "CPU controller; cached particle DFT; CuPy Fourier-native candidate "
-                "transform and NCC reduction; CuPy real-space soft accumulation"
-                if config.candidate_scoring == "fourier"
-                else "CPU adaptive-posterior controller; native CUDA transform; CuPy flat-buffer "
-                "Fourier-NCC scoring and soft accumulation"
-                if engine == "cuda" and config.search_strategy == "adaptive_posterior"
-                else "CPU adaptive-posterior controller; CuPy transform, flat-buffer "
-                "Fourier-NCC scoring, and soft accumulation"
-                if config.search_strategy == "adaptive_posterior"
-                else "CPU polar/controller; native CUDA transform; CuPy Fourier reranking "
-                "and soft accumulation"
-                if engine == "cuda"
-                else "CPU polar/controller; CuPy transform, Fourier reranking, and soft accumulation"
+                "native CUDA quantized-bilinear polar sampling and deterministic angular "
+                "peak/quadratic selection; CuPy batched angular FFT/IFFT and device-side "
+                "top-1/top-2 reduction; final pose/reference/mirror/score/margin transfer only"
+                if engine == "cuda" and config.search_strategy == "polar_hard"
+                else (
+                    "CuPy quantized-bilinear polar sampling, batched angular FFT/IFFT, "
+                    "deterministic peak/quadratic selection, and device-side top-1/top-2 "
+                    "reduction; final pose/reference/mirror/score/margin transfer only"
+                    if config.search_strategy == "polar_hard"
+                    else (
+                        "CPU angular-mode controller; workflow-cached particle DFTs; native CUDA "
+                        "indexed Fourier rotation; CuPy batched cuFFT correlation maps, device-side "
+                        "bounded peak/quadratic translation fitting, and exact Fourier rescoring"
+                        if engine == "cuda"
+                        and config.search_strategy == "quadratic_refine"
+                        else (
+                            "CPU angular-mode controller; workflow-cached particle DFTs; CuPy "
+                            "Fourier rotation, batched cuFFT correlation maps, device-side bounded "
+                            "peak/quadratic translation fitting, and exact Fourier rescoring"
+                            if config.search_strategy == "quadratic_refine"
+                            else (
+                                "CPU controller; workflow-cached scoring/raw particle DFTs; native CUDA indexed "
+                                "Fourier candidate transforms and fused FP64 M-step accumulation; CuPy NCC"
+                                if engine == "cuda"
+                                and config.candidate_scoring == "fourier"
+                                and config.reference_update == "fourier"
+                                else (
+                                    "CPU controller; workflow-cached scoring/raw particle DFTs; CuPy Fourier-native candidate "
+                                    "and M-step transforms, NCC, and Fourier accumulation"
+                                    if config.candidate_scoring == "fourier"
+                                    and config.reference_update == "fourier"
+                                    else (
+                                        "CPU controller; cached particle DFT; native CUDA Fourier-native "
+                                        "candidate transform; CuPy NCC reduction; native CUDA real-space soft accumulation"
+                                        if engine == "cuda"
+                                        and config.candidate_scoring == "fourier"
+                                        else (
+                                            "CPU controller; cached particle DFT; CuPy Fourier-native candidate "
+                                            "transform and NCC reduction; CuPy real-space soft accumulation"
+                                            if config.candidate_scoring == "fourier"
+                                            else (
+                                                "CPU adaptive-posterior controller; native CUDA transform; CuPy flat-buffer "
+                                                "Fourier-NCC scoring and soft accumulation"
+                                                if engine == "cuda"
+                                                and config.search_strategy
+                                                == "adaptive_posterior"
+                                                else (
+                                                    "CPU adaptive-posterior controller; CuPy transform, flat-buffer "
+                                                    "Fourier-NCC scoring, and soft accumulation"
+                                                    if config.search_strategy
+                                                    == "adaptive_posterior"
+                                                    else (
+                                                        "CPU polar/controller; native CUDA transform; CuPy Fourier reranking "
+                                                        "and soft accumulation"
+                                                        if engine == "cuda"
+                                                        else "CPU polar/controller; CuPy transform, Fourier reranking, and soft accumulation"
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
             ),
         }
     )

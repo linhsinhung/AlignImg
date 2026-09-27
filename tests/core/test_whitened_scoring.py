@@ -169,6 +169,7 @@ def test_per_particle_whitening_keeps_fixed_mra_equivalent_to_k1_runs():
         )
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("backend", ["cupy", "cuda"])
 def test_gpu_whitened_workflow_matches_cpu_when_available(backend: str):
     if not ai.available_alignment_backends()[backend]["available"]:

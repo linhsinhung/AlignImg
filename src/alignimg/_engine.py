@@ -11,6 +11,7 @@ import numpy as np
 
 from ._adaptive import STANDARD_CANDIDATE_FIELDS, infer_adaptive_candidates_cpu
 from ._quadratic import infer_quadratic_candidates_cpu
+from ._polar_hard import infer_polar_hard_candidates_cpu
 from ._geometry import CENTER_CONVENTION, integer_center, validate_even_square
 from ._fourier import (
     _candidate_angles,
@@ -90,17 +91,13 @@ def _inlier_weights(
     for group in np.unique(group_values):
         selected = group_values == group
         selected_scores = scores[selected]
-        threshold = float(
-            np.quantile(selected_scores, 1.0 - config.keep_fraction)
-        )
+        threshold = float(np.quantile(selected_scores, 1.0 - config.keep_fraction))
         scale = max(
             float(config.weight_temperature),
             0.25 * float(np.std(selected_scores)),
             1e-6,
         )
-        logits = np.clip(
-            (selected_scores - threshold) / scale, -80.0, 80.0
-        )
+        logits = np.clip((selected_scores - threshold) / scale, -80.0, 80.0)
         output[selected] = 1.0 / (1.0 + np.exp(-logits))
     return output
 
@@ -172,9 +169,7 @@ def _finalize_spatial_reference_sums(
             reference = np.zeros((size, size), dtype=np.float32)
         if pre_shifts is not None:
             shift_y, shift_x = pre_shifts[reference_index]
-            reference = np.roll(
-                reference, (int(shift_y), int(shift_x)), axis=(0, 1)
-            )
+            reference = np.roll(reference, (int(shift_y), int(shift_x)), axis=(0, 1))
         if config.lowpass_sigma > 0:
             reference = cv2.GaussianBlur(reference, (0, 0), config.lowpass_sigma)
         reference *= mask
@@ -258,9 +253,7 @@ def _update_references(
             )
             sums[reference_index] += weight * aligned
             weights[reference_index] += weight
-    references, center_shifts = _finalize_spatial_reference_sums(
-        sums, weights, config
-    )
+    references, center_shifts = _finalize_spatial_reference_sums(sums, weights, config)
     return references, weights.astype(np.float32), center_shifts
 
 
@@ -318,9 +311,7 @@ def _update_references_fourier(
             sums[reference_index] += weight * aligned
             weights[reference_index] += weight
 
-    references, center_shifts = _finalize_fourier_reference_sums(
-        sums, weights, config
-    )
+    references, center_shifts = _finalize_fourier_reference_sums(sums, weights, config)
     return references, weights.astype(np.float32), center_shifts
 
 
@@ -504,6 +495,16 @@ def _apply_reference_center_shifts(
             )
             candidate_values["_mstep_shift_y_px"][selected_mstep] += np.float32(shift_y)
             candidate_values["_mstep_shift_x_px"][selected_mstep] += np.float32(shift_x)
+    if "_polar_center_y_px" in candidate_values:
+        angle = np.deg2rad(candidate_values["angle_deg"].astype(np.float64))
+        shift_y = candidate_values["shift_y_px"].astype(np.float64)
+        shift_x = candidate_values["shift_x_px"].astype(np.float64)
+        candidate_values["_polar_center_y_px"][:] = (
+            -np.sin(angle) * shift_x - np.cos(angle) * shift_y
+        ).astype(np.float32)
+        candidate_values["_polar_center_x_px"][:] = (
+            -np.cos(angle) * shift_x + np.sin(angle) * shift_y
+        ).astype(np.float32)
 
 
 def _stable_frc_cutoff(
@@ -579,7 +580,8 @@ def _halfset_diagnostics(
     particle_fourier: np.ndarray,
 ) -> dict[str, Any]:
     first, first_weights, _ = profile_call(
-        "half_a_update", reference_updater,
+        "half_a_update",
+        reference_updater,
         images,
         candidate_values,
         inlier_weights,
@@ -589,7 +591,8 @@ def _halfset_diagnostics(
         particle_fourier=particle_fourier,
     )
     second, second_weights, _ = profile_call(
-        "half_b_update", reference_updater,
+        "half_b_update",
+        reference_updater,
         images,
         candidate_values,
         inlier_weights,
@@ -673,9 +676,10 @@ def run_soft_alignment_cpu(
         and initial_poses is None
     ):
         raise ValueError(f"{config.search_strategy} search requires initial_poses")
+    polar_translation_centers: np.ndarray | None = None
     if _candidate_inference is None:
 
-        def candidate_inference(*args, rescue_mask=None):
+        def candidate_inference(*args, rescue_mask=None, translation_centers=None):
             if config.search_strategy == "adaptive_posterior":
                 return infer_adaptive_candidates_cpu(
                     *args,
@@ -686,9 +690,22 @@ def run_soft_alignment_cpu(
                     *args,
                     rescue_mask=rescue_mask,
                 )
+            if config.search_strategy == "polar_hard":
+                return infer_polar_hard_candidates_cpu(
+                    *args,
+                    translation_centers=translation_centers,
+                    rescue_mask=rescue_mask,
+                )
             return infer_top_candidates(*args)
+
     else:
-        candidate_inference = _candidate_inference
+
+        def candidate_inference(*args, rescue_mask=None, translation_centers=None):
+            inference_kwargs = {"rescue_mask": rescue_mask}
+            if config.search_strategy == "polar_hard":
+                inference_kwargs["translation_centers"] = translation_centers
+            return _candidate_inference(*args, **inference_kwargs)
+
     reference_updater = _reference_updater or (
         _update_references_fourier
         if config.reference_update == "fourier"
@@ -712,9 +729,13 @@ def run_soft_alignment_cpu(
         and np.all(np.count_nonzero(priors > 0.0, axis=1) == 1)
         else None
     )
-    prepared_particles = profile_call("prepare_particles", prepare_stack, images, config)
+    prepared_particles = profile_call(
+        "prepare_particles", prepare_stack, images, config
+    )
     update_fourier = (
-        profile_call("raw_particle_fft", np.fft.fft2, images, axes=(-2, -1)).astype(np.complex64)
+        profile_call("raw_particle_fft", np.fft.fft2, images, axes=(-2, -1)).astype(
+            np.complex64
+        )
         if config.reference_update == "fourier"
         else prepared_particles.fourier
     )
@@ -725,6 +746,8 @@ def run_soft_alignment_cpu(
     candidate_values: dict[str, np.ndarray] | None = None
     inlier_weights = np.ones(len(images), dtype=np.float32)
     rescue_mask = np.zeros(len(images), dtype=np.bool_)
+    previous_hard_assignments: np.ndarray | None = None
+    previous_hard_poses: PoseSet | None = None
     permutation = np.random.default_rng(config.random_seed).permutation(len(images))
     first_half = np.zeros(len(images), dtype=np.bool_)
     first_half[permutation[: (len(images) + 1) // 2]] = True
@@ -735,16 +758,22 @@ def run_soft_alignment_cpu(
             "prepare_references", prepare_stack, current_references, config
         )
         temperature = _temperature(config, iteration)
+        candidate_kwargs = {"rescue_mask": rescue_mask}
+        if config.search_strategy == "polar_hard":
+            candidate_kwargs["translation_centers"] = polar_translation_centers
+        candidate_started = time.perf_counter()
         candidate_values = profile_call(
-            "candidate_inference", candidate_inference,
+            "candidate_inference",
+            candidate_inference,
             prepared_particles,
             prepared_references,
             config,
             priors,
             temperature,
             pose_prior,
-            rescue_mask=rescue_mask,
+            **candidate_kwargs,
         )
+        candidate_inference_seconds = time.perf_counter() - candidate_started
         next_rescue_mask = np.asarray(
             candidate_values.get("_rescue_next", np.zeros(len(images), dtype=np.bool_)),
             dtype=np.bool_,
@@ -760,6 +789,7 @@ def run_soft_alignment_cpu(
         )
         responsibilities = _responsibilities(candidate_values, len(current_references))
         shared_update = None
+        reference_update_started = time.perf_counter()
         if config.halfset_diagnostics and shared_reference_updater is not None:
             shared_update = profile_call(
                 "shared_reference_update",
@@ -777,7 +807,8 @@ def run_soft_alignment_cpu(
             center_shifts = shared_update.center_shifts
         else:
             updated, effective_weights, center_shifts = profile_call(
-                "full_reference_update", reference_updater,
+                "full_reference_update",
+                reference_updater,
                 images,
                 candidate_values,
                 inlier_weights,
@@ -785,6 +816,7 @@ def run_soft_alignment_cpu(
                 config,
                 particle_fourier=update_fourier,
             )
+        reference_update_seconds = time.perf_counter() - reference_update_started
         minimum_effective_weight = max(
             1.0, 0.01 * len(images) / len(current_references)
         )
@@ -798,11 +830,24 @@ def run_soft_alignment_cpu(
                 updated[reference_index] = prepared_particles.spatial[
                     reseed_order[offset % len(reseed_order)]
                 ]
+        centering_started = time.perf_counter()
         _apply_reference_center_shifts(candidate_values, center_shifts)
+        centering_seconds = time.perf_counter() - centering_started
         # Global and reference-free workflows must continue to explore the full
         # pose space as references evolve. Only an explicit refine workflow is
         # allowed to turn the previous estimate into a local pose prior.
-        pose_prior = _best_poses(candidate_values) if workflow == "refine" else None
+        if config.search_strategy == "polar_hard":
+            best = np.argmax(candidate_values["posterior"], axis=1)
+            rows = np.arange(len(best))
+            polar_translation_centers = np.column_stack(
+                (
+                    candidate_values["_polar_center_y_px"][rows, best],
+                    candidate_values["_polar_center_x_px"][rows, best],
+                )
+            )
+            pose_prior = None
+        else:
+            pose_prior = _best_poses(candidate_values) if workflow == "refine" else None
         rescue_mask = next_rescue_mask
         relative_change = float(
             np.linalg.norm(updated - current_references)
@@ -842,6 +887,7 @@ def run_soft_alignment_cpu(
         map_posterior_values = candidate_values.get(
             "_full_map_posterior", np.max(posterior, axis=1)
         )
+        active_reference_count = np.count_nonzero(priors > 0.0, axis=1).astype(np.int32)
         iteration_diagnostics: dict[str, Any] = {
             "iteration": iteration,
             "temperature": temperature,
@@ -872,6 +918,14 @@ def run_soft_alignment_cpu(
             "mean_map_pose_posterior": float(np.mean(map_posterior_values)),
             "minimum_effective_component_weight": minimum_effective_weight,
             "reseeded_components": empty.astype(np.int32),
+            "effective_search_strategy": config.search_strategy,
+            "effective_candidate_scoring": config.candidate_scoring,
+            "effective_score_model": config.score_model,
+            "active_reference_count": active_reference_count,
+            "candidate_inference_seconds": candidate_inference_seconds,
+            "reference_update_seconds": reference_update_seconds,
+            "centering_seconds": centering_seconds,
+            "frc_diagnostics_seconds": 0.0,
         }
         if config.search_strategy == "adaptive_posterior":
             iteration_diagnostics.update(
@@ -939,17 +993,17 @@ def run_soft_alignment_cpu(
                         np.mean(candidate_values["_quadratic_angular_mode_count"])
                     ),
                     "mean_posterior_support_count": float(
-                        np.mean(
-                            candidate_values[
-                                "_quadratic_posterior_support_count"
-                            ]
-                        )
+                        np.mean(candidate_values["_quadratic_posterior_support_count"])
                     ),
                     "translation_fit_attempt_count": int(
-                        np.sum(candidate_values["_quadratic_translation_fit_attempt_count"])
+                        np.sum(
+                            candidate_values["_quadratic_translation_fit_attempt_count"]
+                        )
                     ),
                     "translation_fit_accept_count": int(
-                        np.sum(candidate_values["_quadratic_translation_fit_accept_count"])
+                        np.sum(
+                            candidate_values["_quadratic_translation_fit_accept_count"]
+                        )
                     ),
                     "angle_fit_attempt_count": int(
                         np.sum(candidate_values["_quadratic_angle_fit_attempt_count"])
@@ -977,11 +1031,96 @@ def run_soft_alignment_cpu(
                     ),
                 }
             )
-        if config.halfset_diagnostics:
-            if shared_update is not None:
-                iteration_diagnostics.update(
-                    _shared_halfset_diagnostics(shared_update)
+        elif config.search_strategy == "polar_hard":
+            hard_assignments = np.argmax(responsibilities, axis=1).astype(np.int32)
+            hard_poses = _best_poses(candidate_values)
+            transition = np.zeros(
+                (len(current_references), len(current_references)), dtype=np.int64
+            )
+            reassignment_fraction = None
+            angle_delta_summary = None
+            shift_delta_summary = None
+            mirror_change_fraction = None
+            if (
+                previous_hard_assignments is not None
+                and previous_hard_poses is not None
+            ):
+                np.add.at(
+                    transition,
+                    (previous_hard_assignments, hard_assignments),
+                    1,
                 )
+                reassignment_fraction = float(
+                    np.mean(hard_assignments != previous_hard_assignments)
+                )
+                angle_delta = np.abs(
+                    (hard_poses.angle_deg - previous_hard_poses.angle_deg + 180.0)
+                    % 360.0
+                    - 180.0
+                )
+                shift_delta = np.hypot(
+                    hard_poses.shift_y_px - previous_hard_poses.shift_y_px,
+                    hard_poses.shift_x_px - previous_hard_poses.shift_x_px,
+                )
+                angle_delta_summary = {
+                    "median": float(np.median(angle_delta)),
+                    "p95": float(np.quantile(angle_delta, 0.95)),
+                    "maximum": float(np.max(angle_delta)),
+                }
+                shift_delta_summary = {
+                    "median": float(np.median(shift_delta)),
+                    "p95": float(np.quantile(shift_delta, 0.95)),
+                    "maximum": float(np.max(shift_delta)),
+                }
+                mirror_change_fraction = float(
+                    np.mean(hard_poses.mirror != previous_hard_poses.mirror)
+                )
+            evaluated_centers = candidate_values["_polar_evaluated_center_count"]
+            boundary_rejections = candidate_values["_polar_boundary_rejected_count"]
+            accepted = candidate_values["_polar_quadratic_fit_accepted"]
+            margins = candidate_values["_polar_objective_margin"][:, 0]
+            iteration_diagnostics.update(
+                {
+                    "mean_polar_translation_center_count": float(
+                        np.mean(evaluated_centers)
+                    ),
+                    "polar_translation_center_count": evaluated_centers.copy(),
+                    "polar_translation_center_count_min": int(
+                        np.min(evaluated_centers)
+                    ),
+                    "polar_translation_center_count_max": int(
+                        np.max(evaluated_centers)
+                    ),
+                    "polar_boundary_rejected_count": int(np.sum(boundary_rejections)),
+                    "polar_boundary_hit_count": int(
+                        np.count_nonzero(boundary_rejections)
+                    ),
+                    "polar_quadratic_fit_accept_count": int(np.sum(accepted)),
+                    "polar_quadratic_fit_attempt_count": len(images),
+                    "polar_quadratic_fit_fallback_count": int(
+                        len(images) - np.sum(accepted)
+                    ),
+                    "polar_angular_bin_count": config.angle_samples,
+                    "polar_objective_margin": margins.copy(),
+                    "polar_objective_margin_min": float(np.min(margins)),
+                    "polar_objective_margin_mean": float(np.mean(margins)),
+                    "polar_objective_margin_median": float(np.median(margins)),
+                    "hard_class_occupancy": np.bincount(
+                        hard_assignments, minlength=len(current_references)
+                    ),
+                    "hard_reassignment_fraction": reassignment_fraction,
+                    "hard_assignment_transition_matrix": transition,
+                    "hard_pose_angle_delta_deg": angle_delta_summary,
+                    "hard_pose_shift_delta_px": shift_delta_summary,
+                    "hard_pose_mirror_change_fraction": mirror_change_fraction,
+                }
+            )
+            previous_hard_assignments = hard_assignments.copy()
+            previous_hard_poses = hard_poses
+        if config.halfset_diagnostics:
+            frc_started = time.perf_counter()
+            if shared_update is not None:
+                iteration_diagnostics.update(_shared_halfset_diagnostics(shared_update))
             else:
                 iteration_diagnostics.update(
                     _halfset_diagnostics(
@@ -995,17 +1134,24 @@ def run_soft_alignment_cpu(
                         update_fourier,
                     )
                 )
+            iteration_diagnostics["frc_diagnostics_seconds"] = (
+                time.perf_counter() - frc_started
+            )
         diagnostics.append(iteration_diagnostics)
         current_references = updated
         if config.store_history:
             history.append(current_references.copy())
         profile = current_profile()
         if profile is not None:
-            profile.iterations.append({
-                "iteration": iteration,
-                "wall_seconds_including_diagnostics": time.perf_counter() - started,
-                "legacy_seconds_excluding_halfsets": iteration_diagnostics["seconds"],
-            })
+            profile.iterations.append(
+                {
+                    "iteration": iteration,
+                    "wall_seconds_including_diagnostics": time.perf_counter() - started,
+                    "legacy_seconds_excluding_halfsets": iteration_diagnostics[
+                        "seconds"
+                    ],
+                }
+            )
 
     assert candidate_values is not None
     responsibilities = _responsibilities(candidate_values, len(current_references))
@@ -1014,6 +1160,13 @@ def run_soft_alignment_cpu(
         **{name: candidate_values[name] for name in STANDARD_CANDIDATE_FIELDS}
     )
     poses = _best_poses(candidate_values)
+    polar_raw_shift_y_values = None
+    polar_raw_shift_x_values = None
+    if "_polar_raw_shift_y_px" in candidate_values:
+        best = np.argmax(candidate_values["posterior"], axis=1)
+        rows = np.arange(len(best))
+        polar_raw_shift_y_values = candidate_values["_polar_raw_shift_y_px"][rows, best]
+        polar_raw_shift_x_values = candidate_values["_polar_raw_shift_x_px"][rows, best]
     active_frequency = prepared_particles.frequency_mask > 0.0
     active_ring_count = np.bincount(
         prepared_particles.score_weight_bins[active_frequency].ravel(),
@@ -1021,9 +1174,9 @@ def run_soft_alignment_cpu(
     )
     active_rings = active_ring_count > 0
     active_profiles = prepared_particles.score_weight_profiles[:, active_rings]
-    profile_means = (
-        active_profiles @ active_ring_count[active_rings]
-    ) / np.sum(active_ring_count)
+    profile_means = (active_profiles @ active_ring_count[active_rings]) / np.sum(
+        active_ring_count
+    )
     return AlignmentResult(
         references=current_references,
         poses=poses,
@@ -1034,7 +1187,11 @@ def run_soft_alignment_cpu(
         diagnostics=diagnostics,
         reference_history=history,
         metadata={
-            "engine": "alignimg-soft-fourier-cpu",
+            "engine": (
+                "alignimg-polar-hard-cpu"
+                if config.search_strategy == "polar_hard"
+                else "alignimg-soft-fourier-cpu"
+            ),
             "backend": _backend_name,
             "workflow": workflow,
             "config": asdict(config),
@@ -1046,27 +1203,42 @@ def run_soft_alignment_cpu(
             "score_model": config.score_model,
             "reference_update": config.reference_update,
             "fft_policy": (
-                "normalized scoring FFT and raw update FFT cached once; Fourier-native "
-                "candidate scoring and Fourier-domain soft M-step; one output IFFT per "
-                "reference plus half-set diagnostic IFFTs when enabled"
-                if config.candidate_scoring == "fourier"
-                and config.reference_update == "fourier"
-                else "particle FFT/polar descriptors cached; Fourier-native rotation, "
-                "translation, and NCC candidate scoring; real-space soft M-step"
-                if config.candidate_scoring == "fourier"
-                else "particle FFT/polar descriptors cached; polar angular proposal and "
-                f"Cartesian Fourier reranking; {config.reference_update}-domain soft M-step"
-                if config.search_strategy == "proposal"
-                else "particle FFT cached; prior-centered correlation-map translation and "
-                f"continuous quadratic pose modes; {config.reference_update}-domain soft M-step"
-                if config.search_strategy == "quadratic_refine"
-                else "particle FFT cached; prior-centered coarse Fourier-NCC scoring; "
-                f"posterior-mass fine oversampling; {config.reference_update}-domain soft M-step"
+                "spatial polar rings per safe translation center; complete angular "
+                "FFT/IFFT correlation; existing reference-update M-step"
+                if config.search_strategy == "polar_hard"
+                else (
+                    "normalized scoring FFT and raw update FFT cached once; Fourier-native "
+                    "candidate scoring and Fourier-domain soft M-step; one output IFFT per "
+                    "reference plus half-set diagnostic IFFTs when enabled"
+                    if config.candidate_scoring == "fourier"
+                    and config.reference_update == "fourier"
+                    else (
+                        "particle FFT/polar descriptors cached; Fourier-native rotation, "
+                        "translation, and NCC candidate scoring; real-space soft M-step"
+                        if config.candidate_scoring == "fourier"
+                        else (
+                            "particle FFT/polar descriptors cached; polar angular proposal and "
+                            f"Cartesian Fourier reranking; {config.reference_update}-domain soft M-step"
+                            if config.search_strategy == "proposal"
+                            else (
+                                "particle FFT cached; prior-centered correlation-map translation and "
+                                f"continuous quadratic pose modes; {config.reference_update}-domain soft M-step"
+                                if config.search_strategy == "quadratic_refine"
+                                else "particle FFT cached; prior-centered coarse Fourier-NCC scoring; "
+                                f"posterior-mass fine oversampling; {config.reference_update}-domain soft M-step"
+                            )
+                        )
+                    )
+                )
             ),
             "score_weighting": (
-                "per-particle inverse three-point-smoothed radial empirical power"
-                if config.score_model == "whitened_fourier_ncc"
-                else "uniform within the configured frequency band"
+                "sqrt-radius weighted, per-ring angular-mean-centered spatial polar rings"
+                if config.score_model == "polar_ring_ccf"
+                else (
+                    "per-particle inverse three-point-smoothed radial empirical power"
+                    if config.score_model == "whitened_fourier_ncc"
+                    else "uniform within the configured frequency band"
+                )
             ),
             "score_weight_summary": {
                 "profile_count": int(len(active_profiles)),
@@ -1076,10 +1248,13 @@ def run_soft_alignment_cpu(
                 "active_maximum": float(np.max(active_profiles)),
             },
             "search_strategy": config.search_strategy,
+            "search_scope": (
+                "global angle exploration; accumulated local translation centers"
+                if config.search_strategy == "polar_hard"
+                else None
+            ),
             "robust_weighting_scope": (
-                "fixed_reference"
-                if fixed_reference_groups is not None
-                else "global"
+                "fixed_reference" if fixed_reference_groups is not None else "global"
             ),
             "relion_like_not_full_relion_likelihood": (
                 config.search_strategy in {"adaptive_posterior", "quadratic_refine"}
@@ -1089,13 +1264,17 @@ def run_soft_alignment_cpu(
             "halfset_update_policy": (
                 "shared_unnormalized_accumulation"
                 if config.halfset_diagnostics and shared_reference_updater is not None
-                else "separate_reference_updates"
-                if config.halfset_diagnostics
-                else "disabled"
+                else (
+                    "separate_reference_updates"
+                    if config.halfset_diagnostics
+                    else "disabled"
+                )
             ),
         },
         _pose_entropy_values=candidate_values.get("_full_pose_entropy"),
         _map_posterior_values=candidate_values.get("_full_map_posterior"),
+        _polar_raw_shift_y_values=polar_raw_shift_y_values,
+        _polar_raw_shift_x_values=polar_raw_shift_x_values,
     )
 
 
