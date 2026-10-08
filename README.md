@@ -29,6 +29,7 @@ acceleration and a CuPy fallback. The default engine uses Fourier NCC scoring,
 cached particle Fourier transforms, and soft Fourier reference updates.
 
 [Features](#features) · [Installation](#installation) ·
+[Algorithm and mathematics](docs/UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md) ·
 [Quick start](#quick-start-align-a-stack-to-a-reference) ·
 [RF and class feedback](#other-alignment-workflows) ·
 [Outputs](#results-and-raw-particle-averages) · [GUI](#optional-gui) ·
@@ -350,7 +351,7 @@ All three alignment workflows return an `AlignmentResult`:
 | Field | Meaning |
 | --- | --- |
 | `poses` | One final MAP pose per particle: `angle_deg`, `shift_y_px`, `shift_x_px`, `mirror`. |
-| `references` | Updated soft Fourier reference models, shape `(K, H, H)`. |
+| `references` | Updated inference reference models: hard for Fast, soft for balanced/refine, shape `(K, H, H)`. |
 | `class_averages` | Output averages, shape `(K, H, H)`; equal to `references` by default. |
 | `reference_assignments` | Final hard reference indices, shape `(N,)`. |
 | `responsibilities` | Soft class probabilities, shape `(N, K)`, with rows summing approximately to one. |

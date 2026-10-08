@@ -1,5 +1,8 @@
 # AlignImg 2.x public API
 
+For the current algorithm, mathematical definitions, and block diagrams, see
+[the AlignImg 2.3.1 algorithm guide](UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md).
+
 The supported 2.x workflows are:
 
 - `reference_free_align(images, *, n_components, config, backend)`
@@ -27,9 +30,9 @@ DFTs and performs
 one output IFFT per reference per iteration. Half-set diagnostics require their
 own two reference IFFTs. `reference_update="spatial"` preserves the frozen 1.8
 comparison path.
-`apply_final_pose_to_raw=False` keeps the final soft M-step reference as
+`apply_final_pose_to_raw=False` keeps the final inference reference as
 `AlignmentResult.class_averages`. When enabled, inference still uses and
-returns the same soft `AlignmentResult.references`, but `class_averages` is
+returns the same inference `AlignmentResult.references`, but `class_averages` is
 reconstructed once after the final iteration from raw particles using their
 final MAP poses, hard class assignments, and inlier weights. Reconstruction
 uses bounded batches, the selected transform backend, and the configured
@@ -185,11 +188,23 @@ runs. See [stage-0 validation](PERFORMANCE_STAGE_0_2_1.zh-TW.md).
 `AlignmentResult.candidates` contains the retained top-L hypotheses and
 top-L-normalized weights; `poses` is their MAP projection. Adaptive inference
 keeps a separate internal ragged fine posterior: responsibilities, reference
-M-step, `pose_entropy`, and `map_posterior` use all fine hypotheses, so changing
-`top_l` only changes the public shortlist rather than the scientific update.
-`AlignmentResult.references` always contains the soft inference references.
+M-step candidate support, `pose_entropy`, and `map_posterior` use all fine
+hypotheses. Changing `top_l` does not truncate that ordinary local support;
+however, robust weighting reads the best raw score in the public shortlist,
+so it can still affect inlier weights and references. Adaptive rescue also
+uses the proposal strategy's top-L support.
+Quadratic inference likewise retains a separate full angle-profile posterior;
+it optimizes translation once per screened angle and replaces accepted angular
+peaks with fitted poses, rather than keeping only angular maxima.
+`AlignmentResult.references` always contains the inference references: hard
+updates for `polar_hard`, soft updates for the soft strategies.
 `AlignmentResult.class_averages` contains the selected final-output estimator;
 with the default configuration it is identical to `references`.
+`poses` selects the joint MAP candidate, while `reference_assignments` selects
+the largest marginal class responsibility. In ambiguous soft MRA those class
+choices need not agree. Final raw averaging uses these public poses and
+assignments without another class-conditioned pose search; fixed-class and
+hard inference do not have that ambiguity.
 Adaptive diagnostics additionally report coarse/selected/fine candidate counts,
 selected posterior mass, retained fine mass, safety-cap hits, local-boundary
 hits, normalized entropy, uncertainty-trigger counts, and rescue counts.

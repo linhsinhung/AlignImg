@@ -1,5 +1,10 @@
 # AlignImg 1.x 實作與科學契約
 
+> 歷史文件：保留 1.x 開發時期的實作脈絡，不代表現行 2.3.1。
+> 目前的搜尋策略、數學公式、Fourier M-step、輸出契約與 block diagrams，請讀
+> [AlignImg 2.3.1 演算法與數學框架](UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md)。
+> 特別是本頁的 raster／spatial update 與 top-L 描述，不適用於所有現行策略。
+
 這份文件記錄 1.0 實際採用的模型、資料流與限制。較完整的統一數學背景見
 `UNIFIED_ALIGNMENT_FRAMEWORK.zh-TW.md`。
 
