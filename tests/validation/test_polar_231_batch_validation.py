@@ -114,6 +114,14 @@ def test_batch_runner_refuses_existing_report(tmp_path):
     assert json.loads(output.read_text()) == {"frozen": True}
 
 
+def test_frozen_solver_is_available_in_source_checkout():
+    assert validation.FROZEN_BACKEND == (
+        validation.mirror.ROOT / "tests/fixtures/polar_231/frozen_t2_backend.py"
+    )
+    frozen = validation.load_frozen_backend()
+    assert frozen.__file__ == str(validation.FROZEN_BACKEND)
+
+
 def test_frozen_solver_is_hash_checked(tmp_path):
     path = tmp_path / "backend.py"
     path.write_text("# not accepted T2 source\n")

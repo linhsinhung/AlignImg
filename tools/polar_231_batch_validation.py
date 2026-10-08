@@ -24,7 +24,7 @@ else:
 
 
 FROZEN_BACKEND = (
-    mirror.ROOT / "validation-results/maintenance-2.3.1/t3-batch/frozen-t2-backend.py"
+    mirror.ROOT / "tests/fixtures/polar_231/frozen_t2_backend.py"
 )
 FROZEN_SHA256 = "cd0524a4f7d702ba0fc97ff2cc8270519789781da4ad6137a4d8d1d657ff412a"
 BATCHES = (1, 7, 256, 512)

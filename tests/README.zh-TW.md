@@ -24,6 +24,18 @@ parity案例有此marker；`tests/gpu/`目前的23個案例使用fake arrays、N
 
 ## 執行方式
 
+### 2.3.1 GitHub source 補充
+
+Polar batch/recovery/streaming 的 CPU regression 使用
+`tests/fixtures/polar_231/frozen_t2_backend.py`，不再依賴未納入 Git 的
+`validation-results/`。這份 historical T2 solver 與已驗證 fixture 逐 byte 相同，
+SHA-256 為 `cd0524a4f7d702ba0fc97ff2cc8270519789781da4ad6137a4d8d1d657ff412a`；
+loader 仍會核對此雜湊。它只用於 regression 對照，不是 runtime backend。
+
+這是封存後的測試可攜性修正，不改 alignment runtime、數值門檻、版本字串或既有
+freeze archives。乾淨 clone 可以執行 CPU 產品與工具測試；server GPU gates 與
+需要真實 benchmark inputs 的歷史實驗，仍須對應硬體及資料。
+
 專案root下的日常回歸：
 
 ```bash
