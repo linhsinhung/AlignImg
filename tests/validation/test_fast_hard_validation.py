@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,6 +23,99 @@ from tools.fast_hard_validation import (
     polar_hard_config,
     synthetic_cases,
 )
+
+
+@pytest.mark.parametrize("fail_parity", [False, True])
+def test_run_case_retains_every_execution_before_parity_gate(
+    tmp_path, monkeypatch, fail_parity
+):
+    from tools import fast_hard_validation as validation
+
+    case = synthetic_cases()["k1_mirror_off"]
+    config = replace(ai.AlignmentConfig.preset("fast3"), batch_size=512)
+    calls = []
+
+    def execute(case, config, backend):
+        index = len(calls)
+        metadata = {
+            "backend": backend,
+            "class_average_batch_size": 512 - index,
+            "class_average_gpu_memory_plan": {"batch_size": 512 - index},
+            "class_average_gpu_memory_events": [],
+            "gpu_workspace": {"budget_bytes": 1000 - index, "closed": True},
+            "gpu_memory_plans": [
+                {
+                    "stage": "polar_hard_candidate_inference",
+                    "batch_size": 90 - index,
+                    "particle_storage_policy": "streaming",
+                }
+            ],
+            "performance": {
+                "gpu_memory": {"entry": {"device_used_bytes": index}},
+                "stages": {
+                    "workflow/alignment_engine/candidate_inference": {
+                        "wall_seconds": 1.0
+                    }
+                },
+            },
+        }
+        result = SimpleNamespace(
+            metadata=metadata,
+            index=index,
+            responsibilities=np.ones((4, 1), np.float32),
+            reference_assignments=np.zeros(4, np.int32),
+            references=case["references"],
+            diagnostics=[],
+        )
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(validation, "_execute", execute)
+    monkeypatch.setattr(validation, "synchronize", lambda backend: None)
+    monkeypatch.setattr(validation, "_check_result", lambda *args: None)
+    monkeypatch.setattr(validation, "_check_hard_result", lambda *args: None)
+    monkeypatch.setattr(validation, "_pose_quality", lambda *args: {})
+    monkeypatch.setattr(
+        validation, "result_hashes", lambda r: {"combined": str(r.index)}
+    )
+    monkeypatch.setattr(
+        validation, "polar_result_arrays", lambda r: {"index": np.array([r.index])}
+    )
+
+    def compare(*args):
+        if fail_parity:
+            raise AssertionError("injected parity failure")
+        return {}
+
+    monkeypatch.setattr(validation, "compare_arrays", compare)
+    records = []
+    kwargs = dict(
+        config=config,
+        backend="cuda",
+        measured_repeats=3,
+        profile_execution=True,
+        output=tmp_path / "run.json",
+        execution_records=records,
+    )
+    if fail_parity:
+        with pytest.raises(AssertionError, match="injected parity failure"):
+            validation.run_case("fixture", case, **kwargs)
+        assert len(records) == 4  # warm-up and all measured runs survive failure
+    else:
+        entry = validation.run_case("fixture", case, **kwargs)
+        assert entry["execution_records"] is records
+        assert [r["phase"] for r in records] == ["warmup"] + ["unprofiled"] * 3 + [
+            "profiled"
+        ]
+        assert not entry["deterministic_exact_match"]
+    for index, record in enumerate(records):
+        assert record["gpu_memory_plans"][0]["batch_size"] == 90 - index
+        assert record["gpu_workspace"]["budget_bytes"] == 1000 - index
+        assert record["result_hashes"]["combined"] == str(index)
+        assert record["class_average_batch_size"] == 512 - index
+        assert record["class_average_gpu_memory_plan"]["batch_size"] == 512 - index
+    calls[0].metadata["gpu_memory_plans"][0]["batch_size"] = 1
+    assert records[0]["gpu_memory_plans"][0]["batch_size"] == 90
 
 
 def test_stage0_baseline_config_freezes_balanced_side_of_future_ab():

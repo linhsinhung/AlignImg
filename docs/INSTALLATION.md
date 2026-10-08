@@ -1,9 +1,15 @@
 # Installation and upgrades
 
-These instructions describe the AlignImg 2.3 source tree: core/GPU/native
-`2.3.0`, optional Workbench `0.7.0`. They do not assume a published PyPI release
-or an existing version tag. See the [release status](RELEASE_FREEZE_2_3.md) for
-validation still required before formal acceptance.
+These instructions describe the AlignImg 2.3.1 source tree: core/GPU/native
+`2.3.1`, optional Workbench `0.7.0`. They do not assume a published PyPI release
+or an existing version tag. The [original 2.3.1 release](RELEASE_FREEZE_2_3_1.md)
+and the later [spatial-cache snapshot](RELEASE_FREEZE_POLAR_SPATIAL.md) are both
+validated, separately frozen builds. Both use version `2.3.1`: identify the
+spatial-cache build by its source manifest and artifact checksum, not by the
+version string alone. The snapshot archive includes the unchanged core wheel
+and the tested spatial-cache GPU sdist; do not substitute the original GPU
+wheel when installing the later snapshot. No reinstall is needed on the server
+that already produced the accepted spatial-cache validation results.
 
 ## Requirements
 
@@ -49,7 +55,7 @@ import alignimg as ai
 print('Core module:', ai.__version__)
 print('Core metadata:', version('alignimg'))
 print('Backends:', ai.available_alignment_backends())
-assert ai.__version__ == version('alignimg') == '2.3.0'
+assert ai.__version__ == version('alignimg') == '2.3.1'
 PY
 ```
 
@@ -107,11 +113,11 @@ import alignimg_gpu
 from alignimg_gpu.backend import _native_module
 
 native = _native_module()
-assert ai.__version__ == version('alignimg') == '2.3.0'
-assert alignimg_gpu.__version__ == version('alignimg-gpu') == '2.3.0'
-assert getattr(native, '__version__', None) == '2.3.0'
+assert ai.__version__ == version('alignimg') == '2.3.1'
+assert alignimg_gpu.__version__ == version('alignimg-gpu') == '2.3.1'
+assert getattr(native, '__version__', None) == '2.3.1'
 assert ai.available_alignment_backends()['cuda']['available']
-print('Core/GPU/native CUDA: 2.3.0')
+print('Core/GPU/native CUDA: 2.3.1')
 print('Native binary:', native.__file__)
 PY
 
@@ -214,6 +220,6 @@ diff before publishing, including test moves and new native source files.
 
 Keep release artifacts and their checksums separate from the source tree. Do
 not rewrite sealed artifacts or historical scientific gates after a test/doc
-cleanup. Formal 2.3 acceptance remains subject to the
-[release record](RELEASE_FREEZE_2_3.md), not merely a successful documentation
+cleanup. Formal 2.3.1 acceptance remains subject to the
+[release record](RELEASE_FREEZE_2_3_1.md), not merely a successful documentation
 update or a push to `main`.

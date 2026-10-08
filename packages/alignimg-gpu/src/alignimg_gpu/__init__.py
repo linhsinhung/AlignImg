@@ -13,7 +13,7 @@ from .backend import (
     transform_images_gpu,
 )
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 __all__ = [
     "backend_status",
     "run_soft_alignment_cuda",

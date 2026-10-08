@@ -16,6 +16,57 @@ def fake_cupy(free_bytes, total_bytes):
     )
 
 
+@pytest.mark.parametrize("engine", ["cuda", "cupy"])
+@pytest.mark.parametrize("polar", [False, True])
+def test_polar_workflow_reclaims_unused_pool_before_initial_budget(
+    monkeypatch, engine, polar
+):
+    from alignimg_gpu import backend
+
+    gib = 1024**3
+    state = {"free": 2 * gib, "released": False}
+
+    def release_unused():
+        state.update(free=6 * gib, released=True)
+
+    cp = SimpleNamespace(
+        cuda=SimpleNamespace(
+            runtime=SimpleNamespace(memGetInfo=lambda: (state["free"], 8 * gib))
+        ),
+        get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=release_unused),
+    )
+    config = ai.AlignmentConfig.preset("fast3") if polar else ai.AlignmentConfig()
+    monkeypatch.setattr(backend, "_cupy", lambda: cp)
+    monkeypatch.setattr(backend, "_native_module", lambda: object())
+    monkeypatch.setattr(backend, "current_profile", lambda: None)
+
+    class StopAfterSnapshot(Exception):
+        pass
+
+    def snapshot(device, settings, records):
+        workspace = WorkflowGpuWorkspace(device, settings, records)
+        expected_free = (6 if polar else 2) * gib
+        assert workspace.summary()["initial_free_bytes"] == expected_free
+        assert workspace.allocation_budget()[
+            "workflow_budget_bytes"
+        ] == expected_free - int((1 - config.memory_fraction) * 8 * gib)
+        assert state["released"] is polar
+        workspace.close()
+        raise StopAfterSnapshot()
+
+    monkeypatch.setattr(backend, "WorkflowGpuWorkspace", snapshot)
+    with pytest.raises(StopAfterSnapshot):
+        backend._run_soft_alignment_gpu_engine(
+            np.zeros((1, 8, 8)),
+            np.zeros((1, 8, 8)),
+            config=config,
+            class_priors=None,
+            initial_poses=None,
+            workflow="global",
+            engine=engine,
+        )
+
+
 def test_workspace_reuses_two_fourier_roles_and_releases_them():
     gib = 1024**3
     records = []

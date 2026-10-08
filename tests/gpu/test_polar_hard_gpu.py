@@ -54,14 +54,15 @@ def _sample_polar_numpy(
     for item, source_index in enumerate(indices):
         source_y = origin + center_y[item] + offsets_y
         source_x = origin + center_x[item] + offsets_x
-        if mirror_values[item]:
-            source_x = 2 * origin - source_x
         quantized_y = np.floor(source_y * 32.0 + 0.5).astype(np.int32)
         quantized_x = np.floor(source_x * 32.0 + 0.5).astype(np.int32)
         y0 = quantized_y >> 5
         x0 = quantized_x >> 5
         y1 = np.minimum(y0 + 1, size - 1)
         x1 = np.minimum(x0 + 1, size - 1)
+        if mirror_values[item]:
+            x0 = (-x0) % size
+            x1 = (-x1) % size
         wy = ((quantized_y & 31) / 32.0).astype(np.float32)
         wx = ((quantized_x & 31) / 32.0).astype(np.float32)
         source = values[source_index]
@@ -335,7 +336,9 @@ def test_polar_memory_plan_accounts_for_ring_and_curve_tensors(monkeypatch):
 
     assert events == ["release", "measure"]
     assert plan.requested_batch_size == 512
-    assert 384 <= plan.batch_size < 512
+    assert 1 <= plan.batch_size <= 384
+    assert plan.particle_storage_policy == "streaming"
+    assert plan.target_particle_batch == 384
     assert plan.bytes_per_item >= 81 * 2 * 256 * 52 * 18
     assert plan.fixed_bytes >= 3 * 256 * 52 * 12
     assert plan.fixed_bytes + plan.batch_size * plan.bytes_per_item <= plan.budget_bytes

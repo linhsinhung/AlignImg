@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import platform
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -48,6 +49,7 @@ from alignimg._profiling import (
 )
 
 from .memory import MemoryPlan, plan_batch_size
+from ._polar_memory import plan_polar_storage
 from ._workspace import WorkflowGpuWorkspace
 
 
@@ -145,20 +147,24 @@ void polar_sample_quantized(
     const double origin = (double)(size / 2);
     double source_y = origin + centers_y[item] + offsets_y[polar_index];
     double source_x = origin + centers_x[item] + offsets_x[polar_index];
-    if (mirrors[item]) source_x = 2.0 * origin - source_x;
-
     // The CPU authority explicitly uses the same 5-bit bilinear table instead
     // of version-dependent cv::warpPolar coordinate generation.
     const int quantized_y = (int)floor(source_y * 32.0 + 0.5);
     const int quantized_x = (int)floor(source_x * 32.0 + 0.5);
     const int y0 = quantized_y >> 5;
-    const int x0 = quantized_x >> 5;
+    int x0 = quantized_x >> 5;
     if (y0 < 0 || x0 < 0 || y0 >= size || x0 >= size) {
         output[index] = 0.0;
         return;
     }
     const int y1 = min(y0 + 1, size - 1);
-    const int x1 = min(x0 + 1, size - 1);
+    int x1 = min(x0 + 1, size - 1);
+    // Quantize the original grid before mapping into the CPU authority's
+    // periodic mirrored image. Reflecting continuous x changes half-way ties.
+    if (mirrors[item]) {
+        x0 = (size - x0) % size;
+        x1 = (size - x1) % size;
+    }
     const float wy = (float)(quantized_y & 31) * (1.0f / 32.0f);
     const float wx = (float)(quantized_x & 31) * (1.0f / 32.0f);
     const float* source = images + (long long)source_index * size * size;
@@ -2242,6 +2248,10 @@ def _polar_memory_plan(
     radial_bins: int,
     maximum_centers: int,
     mirror_count: int,
+    *,
+    workspace=None,
+    force_streaming=False,
+    particle_limit=None,
 ) -> MemoryPlan:
     cp = _cupy()
     # Completed workflows and earlier iterations return arrays to CuPy's pool,
@@ -2249,25 +2259,29 @@ def _polar_memory_plan(
     # memGetInfo so a later case is not incorrectly forced to batch size one.
     cp.get_default_memory_pool().free_all_blocks()
     free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
-    image_bytes = int(size) * int(size) * 4
-    ring_values = int(angle_samples) * int(radial_bins)
-    curve_values = int(reference_count) * int(angle_samples)
-    fixed_bytes = image_bytes * (
-        int(particle_count) + int(reference_count)
-    ) + ring_values * int(reference_count) * (4 + 8)
-    # Per sampled particle/translation/mirror center: real rings, angular FFT,
-    # reduced cross spectrum, correlation curves, selection scratch, and a 1.5x
-    # allowance for cuFFT/einsum workspaces that are not visible as result arrays.
-    bytes_per_center = ring_values * (4 + 8) + curve_values * (8 + 4) + 256
-    bytes_per_particle = bytes_per_center * int(maximum_centers) * int(mirror_count)
-    bytes_per_particle = (bytes_per_particle * 3 + 1) // 2
-    return plan_batch_size(
+    return plan_polar_storage(
+        config,
+        size,
+        particle_count,
+        reference_count,
+        angle_samples,
+        radial_bins,
+        maximum_centers,
+        mirror_count,
         free_bytes=int(free_bytes),
         total_bytes=int(total_bytes),
-        memory_fraction=float(config.memory_fraction),
-        fixed_bytes=fixed_bytes,
-        bytes_per_item=max(1, bytes_per_particle),
-        requested_batch_size=config.batch_size,
+        force_streaming=force_streaming,
+        particle_limit=particle_limit,
+        allow_spatial_cache=(
+            workspace is not None
+            and config.max_iterations > 1
+            and config.reference_update == "fourier"
+            and workspace.spatial_cache_allowed()
+        ),
+        spatial_cache_bytes=(
+            workspace.cache_bytes("polar_spatial") if workspace is not None else 0
+        ),
+        **(workspace.allocation_budget() if workspace is not None else {}),
     )
 
 
@@ -2310,6 +2324,344 @@ def _polar_grid_arrays(
     )
 
 
+def _gpu_polar_batch_solver(
+    particle_images,
+    source_indices,
+    device_grid_y,
+    device_grid_x,
+    device_grid_valid,
+    device_grid_lengths,
+    device_priors,
+    fixed_reference_indices,
+    reference_fft,
+    device_offsets_y,
+    device_offsets_x,
+    config,
+    temperature,
+    *,
+    engine: str,
+):
+    """Solve one batch on device; source indices may address a resident stack."""
+    cp = _cupy()
+    batch_count = len(source_indices)
+    reference_count = len(reference_fft)
+    size = int(particle_images.shape[1])
+    angle_samples = int(config.angle_samples)
+    radial_bins = int(device_offsets_y.shape[1])
+    mirror_count = 2 if config.mirror_search else 1
+    maximum_centers = int(device_grid_y.shape[1])
+    active_priors = device_priors > 0.0
+    log_priors = cp.log(cp.maximum(device_priors, np.finfo(np.float64).tiny))
+    if engine == "cuda":
+        sampler = _polar_sample_cuda
+
+        def peak_selector(curves):
+            return _polar_peak_cuda(curves, size, radial_bins)
+
+    elif engine == "cupy":
+        sampler = _polar_sample_cupy
+        peak_selector = _polar_peak_cupy
+    else:
+        raise ValueError("polar_hard GPU engine must be 'cuda' or 'cupy'")
+
+    best_objective = cp.full(batch_count, -cp.inf, dtype=cp.float64)
+    best_flat_id = cp.full(batch_count, np.iinfo(np.int64).max, dtype=cp.int64)
+    second_objective = cp.full(batch_count, -cp.inf, dtype=cp.float64)
+    second_flat_id = cp.full(batch_count, np.iinfo(np.int64).max, dtype=cp.int64)
+    best_score = cp.full(batch_count, -cp.inf, dtype=cp.float64)
+    best_reference = cp.zeros(batch_count, dtype=cp.int32)
+    best_angle = cp.zeros(batch_count, dtype=cp.float64)
+    best_center_y = cp.zeros(batch_count, dtype=cp.float64)
+    best_center_x = cp.zeros(batch_count, dtype=cp.float64)
+    best_mirror = cp.zeros(batch_count, dtype=cp.uint8)
+    best_peak = cp.zeros(batch_count, dtype=cp.int32)
+    best_accepted = cp.zeros(batch_count, dtype=cp.bool_)
+
+    center_batch = maximum_centers
+    local_rows = cp.arange(batch_count, dtype=cp.int32)
+    for center_start in range(0, maximum_centers, center_batch):
+        center_stop = min(maximum_centers, center_start + center_batch)
+        center_count = center_stop - center_start
+        combo_shape = (batch_count, mirror_count, center_count)
+        image_indices = cp.broadcast_to(
+            source_indices[:, None, None], combo_shape
+        ).reshape(-1)
+        center_y = cp.broadcast_to(
+            device_grid_y[
+                :,
+                None,
+                center_start:center_stop,
+            ],
+            combo_shape,
+        ).reshape(-1)
+        center_x = cp.broadcast_to(
+            device_grid_x[
+                :,
+                None,
+                center_start:center_stop,
+            ],
+            combo_shape,
+        ).reshape(-1)
+        mirrors = cp.broadcast_to(
+            cp.arange(mirror_count, dtype=cp.uint8)[None, :, None],
+            combo_shape,
+        ).reshape(-1)
+        rings = sampler(
+            particle_images,
+            image_indices,
+            center_y,
+            center_x,
+            mirrors,
+            device_offsets_y,
+            device_offsets_x,
+        )
+        rings = _normalize_polar_rings_gpu(rings).reshape(
+            batch_count,
+            mirror_count,
+            center_count,
+            angle_samples,
+            radial_bins,
+        )
+        subject_fft = cp.fft.rfft(rings, axis=3)
+        output_shape = (
+            batch_count,
+            mirror_count,
+            center_count,
+            reference_count,
+        )
+        if fixed_reference_indices is None:
+            cross_spectrum = cp.einsum(
+                "pmcfr,kfr->pmckf",
+                subject_fft,
+                cp.conj(reference_fft),
+                optimize=True,
+            )
+            curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
+            curve_count = int(np.prod(curves.shape[:-1]))
+            peak, offset, score, accepted = peak_selector(
+                curves.reshape(curve_count, angle_samples)
+            )
+            peak = peak.reshape(output_shape)
+            offset = offset.reshape(output_shape)
+            score = score.reshape(output_shape)
+            accepted = accepted.reshape(output_shape)
+        else:
+            fixed_references = fixed_reference_indices[local_rows]
+            fixed_reference_fft = reference_fft[fixed_references]
+            cross_spectrum = cp.einsum(
+                "pmcfr,pfr->pmcf",
+                subject_fft,
+                cp.conj(fixed_reference_fft),
+                optimize=True,
+            )
+            curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
+            curve_count = int(np.prod(curves.shape[:-1]))
+            active_peak, active_offset, active_score, active_accepted = (
+                peak_selector(curves.reshape(curve_count, angle_samples))
+            )
+            active_shape = (batch_count, mirror_count, center_count)
+            active_peak = active_peak.reshape(active_shape)
+            active_offset = active_offset.reshape(active_shape)
+            active_score = active_score.reshape(active_shape)
+            active_accepted = active_accepted.reshape(active_shape)
+            active_slots = (
+                cp.arange(reference_count, dtype=cp.int32)[None, None, None, :]
+                == fixed_references[:, None, None, None]
+            )
+            peak = cp.where(active_slots, active_peak[..., None], 0)
+            offset = cp.where(active_slots, active_offset[..., None], 0.0)
+            score = cp.where(active_slots, active_score[..., None], -cp.inf)
+            accepted = active_slots & active_accepted[..., None]
+        objective = score / float(temperature)
+        objective += log_priors[:, None, None, :]
+        valid = device_grid_valid[
+            :,
+            None,
+            center_start:center_stop,
+            None,
+        ]
+        valid = valid & active_priors[:, None, None, :]
+        objective = cp.where(valid, objective, -cp.inf)
+        ordered = objective.transpose(0, 3, 1, 2).reshape(batch_count, -1)
+        local_index = cp.argmax(ordered, axis=1).astype(cp.int64)
+        candidate_columns = cp.arange(ordered.shape[1], dtype=cp.int64)
+        without_best = cp.where(
+            candidate_columns[None, :] == local_index[:, None],
+            -cp.inf,
+            ordered,
+        )
+        local_second_index = cp.argmax(without_best, axis=1).astype(cp.int64)
+        local_center = (local_index % center_count).astype(cp.int32)
+        reference_mirror = local_index // center_count
+        mirror_index = (reference_mirror % mirror_count).astype(cp.int32)
+        reference_index = (reference_mirror // mirror_count).astype(cp.int32)
+        global_center = local_center + center_start
+        selected_objective = objective[
+            local_rows, mirror_index, local_center, reference_index
+        ]
+        selected_peak = peak[
+            local_rows, mirror_index, local_center, reference_index
+        ]
+        selected_flat_id = (
+            (
+                reference_index.astype(cp.int64) * mirror_count
+                + mirror_index.astype(cp.int64)
+            )
+            * device_grid_lengths[local_rows]
+            + global_center.astype(cp.int64)
+        ) * angle_samples + selected_peak.astype(cp.int64)
+        local_second_center = (local_second_index % center_count).astype(cp.int32)
+        local_second_reference_mirror = local_second_index // center_count
+        local_second_mirror = (local_second_reference_mirror % mirror_count).astype(
+            cp.int32
+        )
+        local_second_reference = (
+            local_second_reference_mirror // mirror_count
+        ).astype(cp.int32)
+        local_second_global_center = local_second_center + center_start
+        local_second_objective = without_best[local_rows, local_second_index]
+        local_second_peak = peak[
+            local_rows,
+            local_second_mirror,
+            local_second_center,
+            local_second_reference,
+        ]
+        local_second_flat_id = (
+            (
+                local_second_reference.astype(cp.int64) * mirror_count
+                + local_second_mirror.astype(cp.int64)
+            )
+            * device_grid_lengths[local_rows]
+            + local_second_global_center.astype(cp.int64)
+        ) * angle_samples + local_second_peak.astype(cp.int64)
+        local_second_flat_id = cp.where(
+            cp.isfinite(local_second_objective),
+            local_second_flat_id,
+            np.iinfo(np.int64).max,
+        )
+        old_objective = best_objective[local_rows]
+        old_flat_id = best_flat_id[local_rows]
+        better = (selected_objective > old_objective) | (
+            (selected_objective == old_objective) & (selected_flat_id < old_flat_id)
+        )
+        objective_pool = cp.stack(
+            (
+                old_objective,
+                second_objective[local_rows],
+                selected_objective,
+                local_second_objective,
+            ),
+            axis=1,
+        )
+        flat_id_pool = cp.stack(
+            (
+                old_flat_id,
+                second_flat_id[local_rows],
+                selected_flat_id,
+                local_second_flat_id,
+            ),
+            axis=1,
+        )
+        pool_maximum = cp.max(objective_pool, axis=1)
+        best_pool_index = cp.argmin(
+            cp.where(
+                objective_pool == pool_maximum[:, None],
+                flat_id_pool,
+                np.iinfo(np.int64).max,
+            ),
+            axis=1,
+        ).astype(cp.int64)
+        pool_columns = cp.arange(4, dtype=cp.int64)
+        remaining_objectives = cp.where(
+            pool_columns[None, :] == best_pool_index[:, None],
+            -cp.inf,
+            objective_pool,
+        )
+        second_pool_maximum = cp.max(remaining_objectives, axis=1)
+        second_pool_index = cp.argmin(
+            cp.where(
+                remaining_objectives == second_pool_maximum[:, None],
+                flat_id_pool,
+                np.iinfo(np.int64).max,
+            ),
+            axis=1,
+        ).astype(cp.int64)
+        best_objective[local_rows] = objective_pool[local_rows, best_pool_index]
+        best_flat_id[local_rows] = flat_id_pool[local_rows, best_pool_index]
+        second_objective[local_rows] = objective_pool[
+            local_rows, second_pool_index
+        ]
+        second_flat_id[local_rows] = flat_id_pool[local_rows, second_pool_index]
+        selected_offset = offset[
+            local_rows, mirror_index, local_center, reference_index
+        ]
+        selected_angle = (selected_peak.astype(cp.float64) + selected_offset) * (
+            360.0 / angle_samples
+        )
+        selected_angle = (selected_angle + 180.0) % 360.0 - 180.0
+        best_score[local_rows] = cp.where(
+            better,
+            score[local_rows, mirror_index, local_center, reference_index],
+            best_score[local_rows],
+        )
+        best_reference[local_rows] = cp.where(
+            better, reference_index, best_reference[local_rows]
+        )
+        best_angle[local_rows] = cp.where(
+            better, selected_angle, best_angle[local_rows]
+        )
+        best_center_y[local_rows] = cp.where(
+            better,
+            device_grid_y[local_rows, global_center],
+            best_center_y[local_rows],
+        )
+        best_center_x[local_rows] = cp.where(
+            better,
+            device_grid_x[local_rows, global_center],
+            best_center_x[local_rows],
+        )
+        best_mirror[local_rows] = cp.where(
+            better,
+            mirror_index.astype(cp.uint8),
+            best_mirror[local_rows],
+        )
+        best_peak[local_rows] = cp.where(
+            better, selected_peak, best_peak[local_rows]
+        )
+        best_accepted[local_rows] = cp.where(
+            better,
+            accepted[local_rows, mirror_index, local_center, reference_index],
+            best_accepted[local_rows],
+        )
+        profile_count("polar_gpu_subject_fft_calls")
+        profile_count("polar_gpu_subject_centers", int(np.prod(combo_shape)))
+        profile_count("polar_gpu_correlation_curves", curve_count)
+
+    radians = best_angle * (np.pi / 180.0)
+    cosine = cp.cos(radians)
+    sine = cp.sin(radians)
+    shift_x = -(cosine * best_center_x + sine * best_center_y)
+    shift_y = sine * best_center_x - cosine * best_center_y
+    objective_margin = best_objective - second_objective
+    packed = cp.stack(
+        (
+            best_reference.astype(cp.float64),
+            best_angle,
+            shift_y,
+            shift_x,
+            best_mirror.astype(cp.float64),
+            best_score,
+            best_center_y,
+            best_center_x,
+            best_peak.astype(cp.float64),
+            best_accepted.astype(cp.float64),
+            objective_margin,
+        ),
+        axis=1,
+    )
+    return packed
+
+
 @profile_stage("polar_hard_gpu", cuda=True)
 def _gpu_polar_hard_candidate_inference_once(
     particles,
@@ -2324,6 +2676,8 @@ def _gpu_polar_hard_candidate_inference_once(
     engine: str,
     particle_limit: int,
     memory_records=None,
+    particle_storage_policy="resident",
+    workspace=None,
 ):
     del initial_poses, rescue_mask
     cp = _cupy()
@@ -2363,30 +2717,34 @@ def _gpu_polar_hard_candidate_inference_once(
     offsets_y, offsets_x = _polar_offsets(radius, angle_samples, radial_bins)
     device_offsets_y = _asdevice(offsets_y, dtype=cp.float64)
     device_offsets_x = _asdevice(offsets_x, dtype=cp.float64)
-    device_grid_y = _asdevice(grid_y, dtype=cp.float64)
-    device_grid_x = _asdevice(grid_x, dtype=cp.float64)
-    device_grid_valid = _asdevice(grid_valid, dtype=cp.bool_)
-    device_grid_lengths = _asdevice(grid_lengths, dtype=cp.int64)
-    device_priors = _asdevice(class_priors, dtype=cp.float64)
-    active_priors = device_priors > 0.0
-    fixed_reference_indices = None
+    fixed_references = None
     if np.all(np.count_nonzero(class_priors > 0.0, axis=1) == 1):
-        fixed_reference_indices = _asdevice(
-            np.argmax(class_priors, axis=1).astype(np.int32), dtype=cp.int32
+        fixed_references = np.argmax(class_priors, axis=1).astype(np.int32)
+    if particle_storage_policy not in {"resident", "streaming", "cached"}:
+        raise ValueError("invalid polar particle storage policy")
+    if particle_storage_policy == "cached":
+        if workspace is None:
+            raise ValueError("cached polar particles require a workflow workspace")
+        particle_images = profile_call(
+            "polar_spatial_cache",
+            workspace.acquire_spatial,
+            particles.spatial,
+            upload=lambda values: _asdevice(values, dtype=cp.float32, order="C"),
         )
-    log_priors = cp.log(cp.maximum(device_priors, np.finfo(np.float64).tiny))
-    particle_images = _asdevice(particles.spatial, dtype=cp.float32, order="C")
+        if particle_images is None:
+            raise RuntimeError("polar spatial cache was disabled after admission")
+    else:
+        particle_images = (
+            _asdevice(particles.spatial, dtype=cp.float32, order="C")
+            if particle_storage_policy == "resident"
+            else None
+        )
     reference_images = _asdevice(references.spatial, dtype=cp.float32, order="C")
 
     if engine == "cuda":
         sampler = _polar_sample_cuda
-
-        def peak_selector(curves):
-            return _polar_peak_cuda(curves, size, radial_bins)
-
     elif engine == "cupy":
         sampler = _polar_sample_cupy
-        peak_selector = _polar_peak_cupy
     else:
         raise ValueError("polar_hard GPU engine must be 'cuda' or 'cupy'")
 
@@ -2402,307 +2760,43 @@ def _gpu_polar_hard_candidate_inference_once(
     reference_rings = _normalize_polar_rings_gpu(reference_rings)
     reference_fft = cp.fft.rfft(reference_rings, axis=1)
 
-    best_objective = cp.full(particle_count, -cp.inf, dtype=cp.float64)
-    best_flat_id = cp.full(particle_count, np.iinfo(np.int64).max, dtype=cp.int64)
-    second_objective = cp.full(particle_count, -cp.inf, dtype=cp.float64)
-    second_flat_id = cp.full(particle_count, np.iinfo(np.int64).max, dtype=cp.int64)
-    best_score = cp.full(particle_count, -cp.inf, dtype=cp.float64)
-    best_reference = cp.zeros(particle_count, dtype=cp.int32)
-    best_angle = cp.zeros(particle_count, dtype=cp.float64)
-    best_center_y = cp.zeros(particle_count, dtype=cp.float64)
-    best_center_x = cp.zeros(particle_count, dtype=cp.float64)
-    best_mirror = cp.zeros(particle_count, dtype=cp.uint8)
-    best_peak = cp.zeros(particle_count, dtype=cp.int32)
-    best_accepted = cp.zeros(particle_count, dtype=cp.bool_)
-
     particle_batch = max(1, min(particle_count, int(particle_limit)))
+    host = np.empty((particle_count, 11), dtype=np.float64)
+    result_download_batches = 0
     for particle_start in range(0, particle_count, particle_batch):
         particle_stop = min(particle_count, particle_start + particle_batch)
-        batch_count = particle_stop - particle_start
-        center_batch = maximum_centers
-        particle_rows = cp.arange(particle_start, particle_stop, dtype=cp.int32)
-        local_rows = cp.arange(batch_count, dtype=cp.int32)
-        for center_start in range(0, maximum_centers, center_batch):
-            center_stop = min(maximum_centers, center_start + center_batch)
-            center_count = center_stop - center_start
-            combo_shape = (batch_count, mirror_count, center_count)
-            image_indices = cp.broadcast_to(
-                particle_rows[:, None, None], combo_shape
-            ).reshape(-1)
-            center_y = cp.broadcast_to(
-                device_grid_y[
-                    particle_start:particle_stop,
-                    None,
-                    center_start:center_stop,
-                ],
-                combo_shape,
-            ).reshape(-1)
-            center_x = cp.broadcast_to(
-                device_grid_x[
-                    particle_start:particle_stop,
-                    None,
-                    center_start:center_stop,
-                ],
-                combo_shape,
-            ).reshape(-1)
-            mirrors = cp.broadcast_to(
-                cp.arange(mirror_count, dtype=cp.uint8)[None, :, None],
-                combo_shape,
-            ).reshape(-1)
-            rings = sampler(
-                particle_images,
-                image_indices,
-                center_y,
-                center_x,
-                mirrors,
-                device_offsets_y,
-                device_offsets_x,
-            )
-            rings = _normalize_polar_rings_gpu(rings).reshape(
-                batch_count,
-                mirror_count,
-                center_count,
-                angle_samples,
-                radial_bins,
-            )
-            subject_fft = cp.fft.rfft(rings, axis=3)
-            output_shape = (
-                batch_count,
-                mirror_count,
-                center_count,
-                reference_count,
-            )
-            if fixed_reference_indices is None:
-                cross_spectrum = cp.einsum(
-                    "pmcfr,kfr->pmckf",
-                    subject_fft,
-                    cp.conj(reference_fft),
-                    optimize=True,
-                )
-                curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
-                curve_count = int(np.prod(curves.shape[:-1]))
-                peak, offset, score, accepted = peak_selector(
-                    curves.reshape(curve_count, angle_samples)
-                )
-                peak = peak.reshape(output_shape)
-                offset = offset.reshape(output_shape)
-                score = score.reshape(output_shape)
-                accepted = accepted.reshape(output_shape)
-            else:
-                fixed_references = fixed_reference_indices[particle_rows]
-                fixed_reference_fft = reference_fft[fixed_references]
-                cross_spectrum = cp.einsum(
-                    "pmcfr,pfr->pmcf",
-                    subject_fft,
-                    cp.conj(fixed_reference_fft),
-                    optimize=True,
-                )
-                curves = cp.fft.irfft(cross_spectrum, n=angle_samples, axis=-1)
-                curve_count = int(np.prod(curves.shape[:-1]))
-                active_peak, active_offset, active_score, active_accepted = (
-                    peak_selector(curves.reshape(curve_count, angle_samples))
-                )
-                active_shape = (batch_count, mirror_count, center_count)
-                active_peak = active_peak.reshape(active_shape)
-                active_offset = active_offset.reshape(active_shape)
-                active_score = active_score.reshape(active_shape)
-                active_accepted = active_accepted.reshape(active_shape)
-                active_slots = (
-                    cp.arange(reference_count, dtype=cp.int32)[None, None, None, :]
-                    == fixed_references[:, None, None, None]
-                )
-                peak = cp.where(active_slots, active_peak[..., None], 0)
-                offset = cp.where(active_slots, active_offset[..., None], 0.0)
-                score = cp.where(active_slots, active_score[..., None], -cp.inf)
-                accepted = active_slots & active_accepted[..., None]
-            objective = score / float(temperature)
-            objective += log_priors[particle_start:particle_stop, None, None, :]
-            valid = device_grid_valid[
-                particle_start:particle_stop,
-                None,
-                center_start:center_stop,
-                None,
-            ]
-            valid = valid & active_priors[particle_start:particle_stop, None, None, :]
-            objective = cp.where(valid, objective, -cp.inf)
-            ordered = objective.transpose(0, 3, 1, 2).reshape(batch_count, -1)
-            local_index = cp.argmax(ordered, axis=1).astype(cp.int64)
-            candidate_columns = cp.arange(ordered.shape[1], dtype=cp.int64)
-            without_best = cp.where(
-                candidate_columns[None, :] == local_index[:, None],
-                -cp.inf,
-                ordered,
-            )
-            local_second_index = cp.argmax(without_best, axis=1).astype(cp.int64)
-            local_center = (local_index % center_count).astype(cp.int32)
-            reference_mirror = local_index // center_count
-            mirror_index = (reference_mirror % mirror_count).astype(cp.int32)
-            reference_index = (reference_mirror // mirror_count).astype(cp.int32)
-            global_center = local_center + center_start
-            selected_objective = objective[
-                local_rows, mirror_index, local_center, reference_index
-            ]
-            selected_peak = peak[
-                local_rows, mirror_index, local_center, reference_index
-            ]
-            selected_flat_id = (
-                (
-                    reference_index.astype(cp.int64) * mirror_count
-                    + mirror_index.astype(cp.int64)
-                )
-                * device_grid_lengths[particle_rows]
-                + global_center.astype(cp.int64)
-            ) * angle_samples + selected_peak.astype(cp.int64)
-            local_second_center = (local_second_index % center_count).astype(cp.int32)
-            local_second_reference_mirror = local_second_index // center_count
-            local_second_mirror = (local_second_reference_mirror % mirror_count).astype(
-                cp.int32
-            )
-            local_second_reference = (
-                local_second_reference_mirror // mirror_count
-            ).astype(cp.int32)
-            local_second_global_center = local_second_center + center_start
-            local_second_objective = without_best[local_rows, local_second_index]
-            local_second_peak = peak[
-                local_rows,
-                local_second_mirror,
-                local_second_center,
-                local_second_reference,
-            ]
-            local_second_flat_id = (
-                (
-                    local_second_reference.astype(cp.int64) * mirror_count
-                    + local_second_mirror.astype(cp.int64)
-                )
-                * device_grid_lengths[particle_rows]
-                + local_second_global_center.astype(cp.int64)
-            ) * angle_samples + local_second_peak.astype(cp.int64)
-            local_second_flat_id = cp.where(
-                cp.isfinite(local_second_objective),
-                local_second_flat_id,
-                np.iinfo(np.int64).max,
-            )
-            old_objective = best_objective[particle_rows]
-            old_flat_id = best_flat_id[particle_rows]
-            better = (selected_objective > old_objective) | (
-                (selected_objective == old_objective) & (selected_flat_id < old_flat_id)
-            )
-            objective_pool = cp.stack(
-                (
-                    old_objective,
-                    second_objective[particle_rows],
-                    selected_objective,
-                    local_second_objective,
-                ),
-                axis=1,
-            )
-            flat_id_pool = cp.stack(
-                (
-                    old_flat_id,
-                    second_flat_id[particle_rows],
-                    selected_flat_id,
-                    local_second_flat_id,
-                ),
-                axis=1,
-            )
-            pool_maximum = cp.max(objective_pool, axis=1)
-            best_pool_index = cp.argmin(
-                cp.where(
-                    objective_pool == pool_maximum[:, None],
-                    flat_id_pool,
-                    np.iinfo(np.int64).max,
-                ),
-                axis=1,
-            ).astype(cp.int64)
-            pool_columns = cp.arange(4, dtype=cp.int64)
-            remaining_objectives = cp.where(
-                pool_columns[None, :] == best_pool_index[:, None],
-                -cp.inf,
-                objective_pool,
-            )
-            second_pool_maximum = cp.max(remaining_objectives, axis=1)
-            second_pool_index = cp.argmin(
-                cp.where(
-                    remaining_objectives == second_pool_maximum[:, None],
-                    flat_id_pool,
-                    np.iinfo(np.int64).max,
-                ),
-                axis=1,
-            ).astype(cp.int64)
-            best_objective[particle_rows] = objective_pool[local_rows, best_pool_index]
-            best_flat_id[particle_rows] = flat_id_pool[local_rows, best_pool_index]
-            second_objective[particle_rows] = objective_pool[
-                local_rows, second_pool_index
-            ]
-            second_flat_id[particle_rows] = flat_id_pool[local_rows, second_pool_index]
-            selected_offset = offset[
-                local_rows, mirror_index, local_center, reference_index
-            ]
-            selected_angle = (selected_peak.astype(cp.float64) + selected_offset) * (
-                360.0 / angle_samples
-            )
-            selected_angle = (selected_angle + 180.0) % 360.0 - 180.0
-            best_score[particle_rows] = cp.where(
-                better,
-                score[local_rows, mirror_index, local_center, reference_index],
-                best_score[particle_rows],
-            )
-            best_reference[particle_rows] = cp.where(
-                better, reference_index, best_reference[particle_rows]
-            )
-            best_angle[particle_rows] = cp.where(
-                better, selected_angle, best_angle[particle_rows]
-            )
-            best_center_y[particle_rows] = cp.where(
-                better,
-                device_grid_y[particle_rows, global_center],
-                best_center_y[particle_rows],
-            )
-            best_center_x[particle_rows] = cp.where(
-                better,
-                device_grid_x[particle_rows, global_center],
-                best_center_x[particle_rows],
-            )
-            best_mirror[particle_rows] = cp.where(
-                better,
-                mirror_index.astype(cp.uint8),
-                best_mirror[particle_rows],
-            )
-            best_peak[particle_rows] = cp.where(
-                better, selected_peak, best_peak[particle_rows]
-            )
-            best_accepted[particle_rows] = cp.where(
-                better,
-                accepted[local_rows, mirror_index, local_center, reference_index],
-                best_accepted[particle_rows],
-            )
-            profile_count("polar_gpu_subject_fft_calls")
-            profile_count("polar_gpu_subject_centers", int(np.prod(combo_shape)))
-            profile_count("polar_gpu_correlation_curves", curve_count)
-
-    radians = best_angle * (np.pi / 180.0)
-    cosine = cp.cos(radians)
-    sine = cp.sin(radians)
-    shift_x = -(cosine * best_center_x + sine * best_center_y)
-    shift_y = sine * best_center_x - cosine * best_center_y
-    objective_margin = best_objective - second_objective
-    packed = cp.stack(
-        (
-            best_reference.astype(cp.float64),
-            best_angle,
-            shift_y,
-            shift_x,
-            best_mirror.astype(cp.float64),
-            best_score,
-            best_center_y,
-            best_center_x,
-            best_peak.astype(cp.float64),
-            best_accepted.astype(cp.float64),
-            objective_margin,
-        ),
-        axis=1,
-    )
-    host = _ashost(packed)
+        batch = slice(particle_start, particle_stop)
+        batch_images = (
+            particle_images
+            if particle_images is not None
+            else _asdevice(particles.spatial[batch], dtype=cp.float32, order="C")
+        )
+        source_start = particle_start if particle_images is not None else 0
+        packed = _gpu_polar_batch_solver(
+            batch_images,
+            cp.arange(
+                source_start, source_start + particle_stop - particle_start,
+                dtype=cp.int32,
+            ),
+            _asdevice(grid_y[batch], dtype=cp.float64),
+            _asdevice(grid_x[batch], dtype=cp.float64),
+            _asdevice(grid_valid[batch], dtype=cp.bool_),
+            _asdevice(grid_lengths[batch], dtype=cp.int64),
+            _asdevice(class_priors[batch], dtype=cp.float64),
+            (
+                _asdevice(fixed_references[batch], dtype=cp.int32)
+                if fixed_references is not None else None
+            ),
+            reference_fft,
+            device_offsets_y,
+            device_offsets_x,
+            config,
+            temperature,
+            engine=engine,
+        )
+        host[batch] = _ashost(packed)
+        del packed, batch_images
+        result_download_batches += 1
     if not np.all(np.isfinite(host[:, [0, 1, 2, 3, 5, 6, 7, 8, 9]])):
         raise RuntimeError("polar_hard GPU search produced non-finite output")
     shape = (particle_count, 1)
@@ -2713,6 +2807,9 @@ def _gpu_polar_hard_candidate_inference_once(
                 "event": "complete",
                 "engine": engine,
                 "particle_batch_size": int(particle_batch),
+                "particle_storage_policy": particle_storage_policy,
+                "maximum_winner_batch_size": int(particle_batch),
+                "result_download_batches": result_download_batches,
                 "maximum_combo_batch_size": int(
                     particle_batch * mirror_count * maximum_centers
                 ),
@@ -2774,7 +2871,7 @@ def _gpu_candidate_inference(
         )
         maximum_centers = int(offsets.size**2)
         mirror_count = 2 if config.mirror_search else 1
-        polar_plan = _polar_memory_plan(
+        plan_args = (
             config,
             particles.spatial.shape[1],
             len(particles.spatial),
@@ -2784,18 +2881,54 @@ def _gpu_candidate_inference(
             maximum_centers,
             mirror_count,
         )
-        limit = polar_plan.batch_size
-        if memory_records is not None:
-            memory_records.append(
-                {
-                    "stage": "polar_hard_candidate_inference",
-                    "item_unit": "particle_with_translation_mirror_centers",
-                    **polar_plan.asdict(),
-                }
-            )
+        records = memory_records if memory_records is not None else []
+        force_streaming, batch_cap, retry_count = False, None, 0
         while True:
+            polar_plan = _polar_memory_plan(
+                *plan_args, workspace=workspace,
+                force_streaming=force_streaming, particle_limit=batch_cap,
+            )
+            # A cache hit never bypasses fresh admission. Drop a retained source
+            # before allocating a streamed batch or reclaiming Fourier caches.
+            if polar_plan.particle_storage_policy != "cached" and workspace is not None:
+                if workspace.disable_cache("polar_spatial", reason="polar_cache_budget"):
+                    polar_plan = _polar_memory_plan(
+                        *plan_args, workspace=workspace,
+                        force_streaming=force_streaming, particle_limit=batch_cap,
+                    )
+            # Budget failure is not allocator OOM. Reclaim rebuildable caches
+            # and remeasure before any upload, preserving the T4 guard.
+            if not polar_plan.fits_minimum and workspace is not None:
+                for role in ("update", "scoring"):
+                    if workspace.disable_cache(role, reason="polar_minimum_budget"):
+                        polar_plan = _polar_memory_plan(
+                            *plan_args, workspace=workspace,
+                            force_streaming=force_streaming, particle_limit=batch_cap,
+                        )
+                    if polar_plan.fits_minimum:
+                        break
+            limit = polar_plan.batch_size
+            attempt_record = {
+                "stage": "polar_hard_candidate_inference",
+                "item_unit": "particle_with_translation_mirror_centers",
+                **polar_plan.asdict(),
+                "requested_particle_batch": config.batch_size,
+                "actual_particle_batch": limit,
+                "oom_retry_count": retry_count,
+            }
+            records.append(attempt_record)
+            if not polar_plan.fits_minimum:
+                error = MemoryError(
+                    "Polar allocation exceeds the VRAM budget: "
+                    f"budget_bytes={polar_plan.budget_bytes}, "
+                    f"fixed_bytes={polar_plan.fixed_bytes}, "
+                    f"minimum_working_bytes={polar_plan.bytes_per_item}, "
+                    f"requested_batch={polar_plan.requested_batch_size}"
+                )
+                error.polar_memory_records = records
+                raise error
             try:
-                return _gpu_polar_hard_candidate_inference_once(
+                result = _gpu_polar_hard_candidate_inference_once(
                     particles,
                     references,
                     config,
@@ -2806,21 +2939,73 @@ def _gpu_candidate_inference(
                     rescue_mask=rescue_mask,
                     engine=engine,
                     particle_limit=limit,
-                    memory_records=memory_records,
+                    memory_records=records,
+                    particle_storage_policy=polar_plan.particle_storage_policy,
+                    workspace=workspace,
                 )
             except Exception as error:
-                if not _is_oom(error) or limit == 1:
+                if not _is_oom(error):
                     raise
-                cp.get_default_memory_pool().free_all_blocks()
-                limit = max(1, limit // 2)
-                if memory_records is not None:
-                    memory_records.append(
-                        {
-                            "stage": "polar_hard_candidate_inference",
-                            "event": "oom_retry",
-                            "particle_batch_size": limit,
-                        }
+                last_oom = f"{type(error).__name__}: {error}"
+                # Unwound sampler/solver/profiling frames can still own device
+                # buffers. Drop them even if a caller retains the exception.
+                pending_errors = [error]
+                while pending_errors:
+                    failed = pending_errors.pop()
+                    pending_errors.extend(
+                        linked for linked in (failed.__cause__, failed.__context__)
+                        if linked is not None
                     )
+                    traceback.clear_frames(failed.__traceback__)
+                    failed.__traceback__ = failed.__context__ = failed.__cause__ = None
+                del failed
+            else:
+                if records[-1].get("event") == "complete":
+                    records[-1].update(
+                        requested_particle_batch=config.batch_size,
+                        actual_particle_batch=limit,
+                        oom_retry_count=retry_count,
+                    )
+                return result
+
+            # Recovery is outside except: failed device arrays must be gone
+            # before evicting caches, freeing pooled blocks or remeasuring.
+            evicted = False
+            if polar_plan.particle_storage_policy in {"resident", "cached"}:
+                if workspace is not None:
+                    workspace.disable_cache("polar_spatial", reason="polar_oom")
+                action = "streaming"
+            else:
+                if workspace is not None:
+                    for role in ("polar_spatial", "update", "scoring"):
+                        evicted |= workspace.disable_cache(role, reason="polar_oom")
+                action = "evict_caches" if evicted else "halve_batch"
+            cp.get_default_memory_pool().free_all_blocks()
+            if (
+                polar_plan.particle_storage_policy == "streaming"
+                and not evicted and limit == 1
+            ):
+                records.append({
+                    **attempt_record, "event": "oom_failure", "error": last_oom,
+                })
+                error = MemoryError(
+                    "Polar streaming batch 1 exhausted OOM recovery: "
+                    f"budget_bytes={polar_plan.budget_bytes}, "
+                    f"fixed_bytes={polar_plan.fixed_bytes}, "
+                    f"minimum_working_bytes={polar_plan.bytes_per_item}, "
+                    f"requested_batch={config.batch_size}, "
+                    f"oom_retry_count={retry_count}; {last_oom}"
+                )
+                error.polar_memory_records = records
+                raise error from None
+            force_streaming = True
+            batch_cap = limit if action != "halve_batch" else max(1, limit // 2)
+            retry_count += 1
+            records.append({
+                **attempt_record, "event": "oom_retry", "action": action,
+                "next_particle_batch_cap": batch_cap,
+                "oom_retry_count": retry_count, "error": last_oom,
+            })
     plan = _memory_plan(config, particles.spatial.shape[1], len(references.spatial))
     limit = plan.batch_size
     if memory_records is not None:
@@ -3107,8 +3292,12 @@ def _gpu_reference_updater(
             evicted = False
             if workspace is not None:
                 evicted = workspace.disable_cache(
-                    "update", reason="reference_update_oom"
+                    "polar_spatial", reason="reference_update_oom"
                 )
+                if not evicted:
+                    evicted = workspace.disable_cache(
+                        "update", reason="reference_update_oom"
+                    )
                 if not evicted:
                     evicted = workspace.disable_cache(
                         "scoring", reason="reference_update_oom"
@@ -3396,8 +3585,12 @@ def _gpu_shared_reference_updater(
             evicted = False
             if workspace is not None:
                 evicted = workspace.disable_cache(
-                    "update", reason="shared_reference_update_oom"
+                    "polar_spatial", reason="shared_reference_update_oom"
                 )
+                if not evicted:
+                    evicted = workspace.disable_cache(
+                        "update", reason="shared_reference_update_oom"
+                    )
                 if not evicted:
                     evicted = workspace.disable_cache(
                         "scoring", reason="shared_reference_update_oom"
@@ -3447,6 +3640,10 @@ def _run_soft_alignment_gpu_engine(
 
     memory_records: list[dict[str, object]] = []
     cp = _cupy()
+    if config.search_strategy == "polar_hard":
+        # The workflow ceiling must include reclaimable blocks before it is
+        # frozen; releasing them in the later polar planner is too late.
+        cp.get_default_memory_pool().free_all_blocks()
     profile = current_profile()
     if profile is not None:
         profile.attach_cuda(cp)

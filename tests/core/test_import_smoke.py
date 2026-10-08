@@ -23,7 +23,7 @@ def test_public_package_imports():
         "convert_v1_4_poses_to_integer_center",
     ]
 
-    assert alignimg.__version__ == "2.3.0"
+    assert alignimg.__version__ == "2.3.1"
     assert alignimg.__all__ == expected_public
     for name in expected_public:
         assert hasattr(alignimg, name)

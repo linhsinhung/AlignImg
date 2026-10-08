@@ -21,8 +21,12 @@ class MemoryPlan:
     automatic_batch_soft_cap: int
     batch_size: int
 
-    def asdict(self) -> dict[str, int | None]:
-        return asdict(self)
+    @property
+    def fits_minimum(self) -> bool:
+        return self.fixed_bytes + self.bytes_per_item <= self.budget_bytes
+
+    def asdict(self) -> dict[str, int | bool | None]:
+        return {**asdict(self), "fits_minimum": self.fits_minimum}
 
 
 def plan_batch_size(

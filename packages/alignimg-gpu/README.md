@@ -78,7 +78,27 @@ on the GPU, using CuPy batched angular FFT/IFFT. Only final winners, scores, and
 margins return to the host; full correlation maps stay on the device. The same
 Fourier reference updater and final raw-average accumulator serve hard and soft
 inference. `fast3` runs three iterations and enables final raw reconstruction.
-The core, GPU package, and native build stamp must all be `2.3.0`.
+The core, GPU package, and native build stamp must all be `2.3.1`.
+
+In the original 2.3.1 freeze, polar inference chooses resident particles only when the full stack
+and requested batch workspace fit the shared budget. Otherwise it streams
+particle batches, accounting for live Fourier caches without counting them
+twice. Recovery tries streaming, evicts rebuildable caches, then halves the
+batch; an infeasible one-particle plan fails before upload. Full correlation
+maps remain on device. See the [memory policy](../../docs/POLAR_231_T4_MEMORY_POLICY.zh-TW.md)
+and [2.3.1 release status](../../docs/RELEASE_FREEZE_2_3_1.md).
+
+The separately frozen [spatial-cache snapshot](../../docs/RELEASE_FREEZE_POLAR_SPATIAL.md)
+retains prepared FP32 spatial particles across iterations of one polar workflow
+with Fourier reference updates, when the shared budget permits. Source residency
+does not require the entire requested solver batch to fit at once. Admission is
+rechecked each iteration; Fourier workspace has priority and may evict this
+optional cache. Eviction or upload OOM disables it for the rest of the workflow,
+which then uses the original per-call resident/streaming paths. References and
+translation grids still refresh each iteration, and workflow exit releases the
+cache. This is not a raw-image cache and cannot replace final raw-output uploads.
+The package/native stamps remain `2.3.1`; use the snapshot manifest and checksums
+to distinguish it from the original release artifacts.
 
 When `apply_final_pose_to_raw=True`, the input NumPy stack is still streamed to
 the selected GPU backend in VRAM-bounded batches. Final-pose transforms and

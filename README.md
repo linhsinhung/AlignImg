@@ -11,7 +11,11 @@ The library is general-purpose within its even-square 2-D image contract;
 cryo-EM provides the principal validation datasets. Fast 3 supports frequent
 classification/alignment feedback, while balanced inference supports quality
 checkpoints and final convergence. Release scope and evidence are recorded in
-[the 2.3 release freeze](docs/RELEASE_FREEZE_2_3.md).
+[the 2.3.1 release status](docs/RELEASE_FREEZE_2_3_1.md).
+The accepted [spatial-cache snapshot](docs/RELEASE_FREEZE_POLAR_SPATIAL.md)
+adds workflow-scoped polar particle reuse without changing package versions or
+search mathematics. It is a separately identified internal freeze, not a new
+published release or a general speedup claim.
 
 AlignImg was developed by studying the alignment concepts, published methods,
 and practical workflows established by EMAN2 and RELION. With AI-assisted
@@ -463,6 +467,7 @@ details are documented in the [third-party notices](THIRD_PARTY_NOTICES.md), the
 - [Continuous quadratic refinement](docs/CONTINUOUS_QUADRATIC_REFINEMENT_2_2.md)
 - [GPU installation and execution](packages/alignimg-gpu/README.md)
 - [2.3 release scope and validation status](docs/RELEASE_FREEZE_2_3.md)
+- [2.3.1 maintenance release and accepted compatibility exception](docs/RELEASE_FREEZE_2_3_1.md)
 
 For the daily CPU regression suite (core alignment and GPU-backend emulation,
 without real GPU hardware or private validation datasets):

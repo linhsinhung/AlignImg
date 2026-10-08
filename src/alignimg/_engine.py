@@ -486,6 +486,8 @@ def _apply_reference_center_shifts(
     candidate_values: dict[str, np.ndarray], shifts: list[tuple[float, float]]
 ) -> None:
     for reference_index, (shift_y, shift_x) in enumerate(shifts):
+        if shift_y == 0.0 and shift_x == 0.0:
+            continue
         selected = candidate_values["reference_index"] == reference_index
         candidate_values["shift_y_px"][selected] += np.float32(shift_y)
         candidate_values["shift_x_px"][selected] += np.float32(shift_x)
@@ -495,16 +497,18 @@ def _apply_reference_center_shifts(
             )
             candidate_values["_mstep_shift_y_px"][selected_mstep] += np.float32(shift_y)
             candidate_values["_mstep_shift_x_px"][selected_mstep] += np.float32(shift_x)
-    if "_polar_center_y_px" in candidate_values:
-        angle = np.deg2rad(candidate_values["angle_deg"].astype(np.float64))
-        shift_y = candidate_values["shift_y_px"].astype(np.float64)
-        shift_x = candidate_values["shift_x_px"].astype(np.float64)
-        candidate_values["_polar_center_y_px"][:] = (
-            -np.sin(angle) * shift_x - np.cos(angle) * shift_y
-        ).astype(np.float32)
-        candidate_values["_polar_center_x_px"][:] = (
-            -np.cos(angle) * shift_x + np.sin(angle) * shift_y
-        ).astype(np.float32)
+        if "_polar_center_y_px" in candidate_values:
+            angle = np.deg2rad(
+                candidate_values["angle_deg"][selected].astype(np.float64)
+            )
+            shifted_y = candidate_values["shift_y_px"][selected].astype(np.float64)
+            shifted_x = candidate_values["shift_x_px"][selected].astype(np.float64)
+            candidate_values["_polar_center_y_px"][selected] = (
+                -np.sin(angle) * shifted_x - np.cos(angle) * shifted_y
+            ).astype(np.float32)
+            candidate_values["_polar_center_x_px"][selected] = (
+                -np.cos(angle) * shifted_x + np.sin(angle) * shifted_y
+            ).astype(np.float32)
 
 
 def _stable_frc_cutoff(

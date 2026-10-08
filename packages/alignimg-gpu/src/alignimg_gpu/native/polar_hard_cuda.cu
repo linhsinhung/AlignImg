@@ -47,19 +47,24 @@ __global__ void sample_polar_quantized(
     const double origin = static_cast<double>(size / 2);
     const double source_y =
         origin + centers_y[item] + offsets_y[polar_index];
-    double source_x =
+    const double source_x =
         origin + centers_x[item] + offsets_x[polar_index];
-    if (mirrors[item] != 0) source_x = 2.0 * origin - source_x;
     const int quantized_y = static_cast<int>(floor(source_y * 32.0 + 0.5));
     const int quantized_x = static_cast<int>(floor(source_x * 32.0 + 0.5));
     const int y0 = quantized_y >> 5;
-    const int x0 = quantized_x >> 5;
+    int x0 = quantized_x >> 5;
     if (y0 < 0 || x0 < 0 || y0 >= size || x0 >= size) {
         output[index] = 0.0;
         return;
     }
     const int y1 = min(y0 + 1, size - 1);
-    const int x1 = min(x0 + 1, size - 1);
+    int x1 = min(x0 + 1, size - 1);
+    // Sample the CPU authority's periodic mirror after quantizing the original
+    // coordinates; retain the original interpolation weights and rounding.
+    if (mirrors[item] != 0) {
+        x0 = (size - x0) % size;
+        x1 = (size - x1) % size;
+    }
     const float wy = static_cast<float>(quantized_y & 31) * (1.0f / 32.0f);
     const float wx = static_cast<float>(quantized_x & 31) * (1.0f / 32.0f);
     const float* source = images +

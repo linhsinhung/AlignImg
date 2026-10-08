@@ -12,7 +12,7 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(_native, module) {
     module.doc() = "AlignImg native CUDA primitives";
-    module.attr("__version__") = "2.3.0";
+    module.attr("__version__") = "2.3.1";
     py::class_<alignimg_gpu::PolarHardSession>(module, "PolarHardSession")
         .def(
             py::init<int, int, int, int>(),

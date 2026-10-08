@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
 import importlib.util
@@ -697,12 +698,49 @@ def run_case(
     variant: str = "global_balanced_2.2_baseline",
     result_label: str = "baseline",
     profile_repeats: int = 1,
+    execution_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # A caller-owned list survives a later parity/check failure. Capture outside
+    # timing and do not query or change the device/pool while recording metadata.
+    if execution_records is None:
+        execution_records = []
+
+    def record(result, phase, index, seconds):
+        hashes = result_hashes(result)
+        execution_records.append(
+            {
+                "phase": phase,
+                "index": index,
+                "seconds": seconds,
+                "result_hashes": hashes,
+                **deepcopy(
+                    {
+                        key: result.metadata.get(key)
+                        for key in (
+                            "backend",
+                            "gpu_workspace",
+                            "gpu_memory_plans",
+                            "gpu_memory_plan_at_completion",
+                            "class_average_transform_backend",
+                            "class_average_batch_size",
+                            "class_average_gpu_memory_plan",
+                            "class_average_gpu_memory_events",
+                        )
+                    }
+                ),
+                "profile_gpu_memory": deepcopy(
+                    (result.metadata.get("performance") or {}).get("gpu_memory")
+                ),
+            }
+        )
+        return hashes
+
     synchronize(backend)
     started = time.perf_counter()
     warmup = _execute(case, config, backend)
     synchronize(backend)
     warmup_seconds = time.perf_counter() - started
+    record(warmup, "warmup", 0, warmup_seconds)
     _check_result(warmup, backend, case)
     if config.top_l == 1:
         _check_hard_result(warmup)
@@ -710,17 +748,17 @@ def run_case(
     results = []
     seconds = []
     hashes = []
-    for _ in range(measured_repeats):
+    for index in range(measured_repeats):
         synchronize(backend)
         started = time.perf_counter()
         current = _execute(case, config, backend)
         synchronize(backend)
         seconds.append(time.perf_counter() - started)
+        hashes.append(record(current, "unprofiled", index, seconds[-1]))
         _check_result(current, backend, case)
         if config.top_l == 1:
             _check_hard_result(current)
         results.append(current)
-        hashes.append(result_hashes(current))
     primary = results[0]
     parity = [
         compare_arrays(polar_result_arrays(primary), polar_result_arrays(value))
@@ -731,10 +769,12 @@ def run_case(
     profile_parities = []
     profiled_candidate_inference_seconds = []
     if profile_execution:
-        for _ in range(profile_repeats):
+        for index in range(profile_repeats):
             synchronize(backend)
+            started = time.perf_counter()
             current = _execute(case, replace(config, profile_execution=True), backend)
             synchronize(backend)
+            record(current, "profiled", index, time.perf_counter() - started)
             _check_result(current, backend, case)
             if config.top_l == 1:
                 _check_hard_result(current)
@@ -791,6 +831,7 @@ def run_case(
         "unprofiled_wall_seconds": seconds,
         "unprofiled_median_seconds": float(np.median(seconds)),
         "deterministic_hashes": hashes,
+        "execution_records": execution_records,
         "deterministic_exact_match": len({item["combined"] for item in hashes}) == 1,
         "repeat_parity": parity,
         "profile_parity": profile_parities[0] if profile_parities else None,

@@ -23,9 +23,11 @@ def test_requested_batch_is_a_cap_not_a_vram_override():
     assert plan.reserve_bytes == 6 * gib
     assert plan.batch_size == 208
     assert plan.batch_size < plan.requested_batch_size
+    assert plan.fits_minimum
+    assert plan.asdict()["fits_minimum"] is True
 
 
-def test_low_free_memory_degrades_to_one_item_safely():
+def test_low_free_memory_keeps_one_item_but_marks_plan_infeasible():
     mib = 1024**2
     plan = memory.plan_batch_size(
         free_bytes=300 * mib,
@@ -37,6 +39,24 @@ def test_low_free_memory_degrades_to_one_item_safely():
     )
     assert plan.batch_size == 1
     assert plan.budget_bytes == 0
+    assert not plan.fits_minimum
+    assert plan.asdict()["fits_minimum"] is False
+
+
+def test_minimum_feasibility_includes_fixed_allocation_and_one_item():
+    mib = 1024**2
+    kwargs = dict(
+        free_bytes=512 * mib,
+        total_bytes=512 * mib,
+        memory_fraction=1.0,
+        fixed_bytes=128 * mib,
+        requested_batch_size=512,
+    )
+    exact = memory.plan_batch_size(bytes_per_item=128 * mib, **kwargs)
+    too_large = memory.plan_batch_size(bytes_per_item=128 * mib + 1, **kwargs)
+    assert exact.batch_size == too_large.batch_size == 1
+    assert exact.fits_minimum
+    assert not too_large.fits_minimum
 
 
 def test_automatic_batch_has_soft_cap_but_explicit_batch_can_exceed_it():
